@@ -1,0 +1,4 @@
+# Replace these illustrative names with your own 5-32 character candidates.
+# Entries are NOT guaranteed to be free.
+# @mybrand
+# @devhub
