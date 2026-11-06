@@ -1,7 +1,8 @@
 """Environment configuration, without storing credentials in source code."""
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import os
 from pathlib import Path
+import re
 
 from dotenv import load_dotenv
 
@@ -20,6 +21,9 @@ class Config:
     cycle_pause_seconds: float
     max_per_cycle: int
     alert_first_free: bool
+    proxy_host: str | None = None
+    proxy_port: int | None = None
+    proxy_secret: str | None = field(default=None, repr=False)
 
 
 def _float_env(key: str, default: float, min_value: float) -> float:
@@ -42,6 +46,19 @@ def load_config() -> Config:
     max_per_cycle = int(os.getenv("MAX_PER_CYCLE", "20"))
     if not 1 <= max_per_cycle <= 1000:
         raise ValueError("MAX_PER_CYCLE должен быть в диапазоне 1–1000")
+    proxy_host = os.getenv("TG_PROXY_HOST", "").strip()
+    raw_proxy_port = os.getenv("TG_PROXY_PORT", "").strip()
+    proxy_secret = os.getenv("TG_PROXY_SECRET", "").strip()
+    if any((proxy_host, raw_proxy_port, proxy_secret)) and not all((proxy_host, raw_proxy_port, proxy_secret)):
+        raise ValueError("Укажите TG_PROXY_HOST, TG_PROXY_PORT и TG_PROXY_SECRET вместе")
+    proxy_port = None
+    if proxy_host:
+        if not raw_proxy_port.isdecimal() or not 1 <= int(raw_proxy_port) <= 65535:
+            raise ValueError("TG_PROXY_PORT должен быть целым числом от 1 до 65535")
+        proxy_port = int(raw_proxy_port)
+        if not re.fullmatch(r"(?:[0-9a-fA-F]{32}|[dD]{2}[0-9a-fA-F]{32})", proxy_secret):
+            raise ValueError("TG_PROXY_SECRET должен содержать 32 шестнадцатеричных символа или dd и ещё 32")
+        proxy_secret = proxy_secret.lower()
     return Config(
         api_id=int(raw_id),
         api_hash=api_hash,
@@ -55,4 +72,7 @@ def load_config() -> Config:
         cycle_pause_seconds=_float_env("CYCLE_PAUSE_SECONDS", 600, 60),
         max_per_cycle=max_per_cycle,
         alert_first_free=os.getenv("ALERT_FIRST_FREE", "true").lower() in ("1", "true", "yes"),
+        proxy_host=proxy_host or None,
+        proxy_port=proxy_port,
+        proxy_secret=proxy_secret or None,
     )

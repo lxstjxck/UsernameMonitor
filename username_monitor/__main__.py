@@ -12,10 +12,23 @@ from .store import Store
 LOG = logging.getLogger("username_monitor")
 
 
-async def login(config) -> None:
+def create_telegram_client(config, *, flood_sleep_threshold=None):
     from telethon import TelegramClient
+
+    options = {}
+    if config.proxy_host is not None:
+        from telethon.network.connection import ConnectionTcpMTProxyRandomizedIntermediate
+
+        options["connection"] = ConnectionTcpMTProxyRandomizedIntermediate
+        options["proxy"] = (config.proxy_host, config.proxy_port, config.proxy_secret)
+    if flood_sleep_threshold is not None:
+        options["flood_sleep_threshold"] = flood_sleep_threshold
+    return TelegramClient(str(config.session_path), config.api_id, config.api_hash, **options)
+
+
+async def login(config) -> None:
     config.session_path.parent.mkdir(parents=True, exist_ok=True)
-    client = TelegramClient(str(config.session_path), config.api_id, config.api_hash)
+    client = create_telegram_client(config)
     try:
         await client.start()
         me = await client.get_me()
@@ -66,10 +79,8 @@ async def one_cycle(client, config, store: Store, limit: int) -> float:
 
 
 async def monitor(config, once: bool, limit: int) -> None:
-    from telethon import TelegramClient
     config.session_path.parent.mkdir(parents=True, exist_ok=True)
-    client = TelegramClient(str(config.session_path), config.api_id, config.api_hash,
-                            flood_sleep_threshold=0)
+    client = create_telegram_client(config, flood_sleep_threshold=0)
     await client.connect()
     try:
         if not await client.is_user_authorized():
