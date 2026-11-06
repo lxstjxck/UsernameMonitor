@@ -60,10 +60,14 @@ async def one_cycle(client, config, store: Store, limit: int) -> float:
             previous, changed = store.record(name, status, note)
             LOG.info("@%s: %s%s", name, status, f" (было {previous})" if changed else "")
             if status == "free" and changed and (previous is not None or config.alert_first_free):
-                await notify(config.bot_token, config.chat_id,
-                             f"🟢 Возможный свободный username: @{name}\n"
-                             f"До этого: {previous or 'не проверялся'}\n"
-                             "Проверь и назначь вручную в Telegram. Доступность не гарантирована.")
+                delivered = await notify(config.bot_token, config.chat_id,
+                                         f"🟢 Возможный свободный username: @{name}\n"
+                                         f"До этого: {previous or 'не проверялся'}\n"
+                                         "Проверь и назначь вручную в Telegram. Доступность не гарантирована.",
+                                         bot_proxy_url=config.bot_proxy_url,
+                                         bot_proxy_secret=config.bot_proxy_secret)
+                if not delivered:
+                    LOG.warning("@%s: уведомление не доставлено", name)
         except errors.FloodWaitError as exc:
             cooldown = max(config.cycle_pause_seconds, float(exc.seconds) + 60)
             store.mark_error(name, "FloodWait")

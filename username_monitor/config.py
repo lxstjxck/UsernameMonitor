@@ -3,6 +3,7 @@ from dataclasses import dataclass, field
 import os
 from pathlib import Path
 import re
+from urllib.parse import urlsplit
 
 from dotenv import load_dotenv
 
@@ -10,11 +11,11 @@ from dotenv import load_dotenv
 @dataclass(frozen=True)
 class Config:
     api_id: int
-    api_hash: str
+    api_hash: str = field(repr=False)
     session_path: Path
     db_path: Path
     usernames_path: Path
-    bot_token: str
+    bot_token: str = field(repr=False)
     chat_id: str
     delay_seconds: float
     confirm_delay_seconds: float
@@ -25,6 +26,8 @@ class Config:
     proxy_host: str | None = None
     proxy_port: int | None = None
     proxy_secret: str | None = field(default=None, repr=False)
+    bot_proxy_url: str | None = None
+    bot_proxy_secret: str | None = field(default=None, repr=False)
 
 
 def _float_env(key: str, default: float, min_value: float) -> float:
@@ -42,7 +45,24 @@ def load_config() -> Config:
         raise ValueError("Укажите TG_API_ID и TG_API_HASH в .env (my.telegram.org)")
     bot_token = os.getenv("BOT_TOKEN", "").strip()
     chat_id = os.getenv("CHAT_ID", "").strip()
-    if bool(bot_token) != bool(chat_id):
+    bot_proxy_url = os.getenv("BOT_PROXY_URL", "").strip()
+    bot_proxy_secret = os.getenv("BOT_PROXY_SECRET", "").strip()
+    if bool(bot_proxy_url) != bool(bot_proxy_secret):
+        raise ValueError("Укажите BOT_PROXY_URL и BOT_PROXY_SECRET вместе")
+    if bot_proxy_url:
+        try:
+            parsed = urlsplit(bot_proxy_url)
+            port = parsed.port
+        except ValueError:
+            port = -1
+            parsed = None
+        if (parsed is None or parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password
+                or port == -1 or (port is not None and not 1 <= port <= 65535)
+                or parsed.path not in ("", "/") or "?" in bot_proxy_url or "#" in bot_proxy_url):
+            raise ValueError("BOT_PROXY_URL должен быть HTTPS-адресом Worker без пути, параметров и учётных данных")
+        if not chat_id:
+            raise ValueError("Укажите CHAT_ID для уведомлений через Worker")
+    elif bool(bot_token) != bool(chat_id):
         raise ValueError("BOT_TOKEN и CHAT_ID нужно заполнить вместе или оставить оба пустыми")
     max_per_cycle = int(os.getenv("MAX_PER_CYCLE", "20"))
     if not 1 <= max_per_cycle <= 1000:
@@ -77,4 +97,6 @@ def load_config() -> Config:
         proxy_host=proxy_host or None,
         proxy_port=proxy_port,
         proxy_secret=proxy_secret or None,
+        bot_proxy_url=bot_proxy_url.rstrip("/") or None,
+        bot_proxy_secret=bot_proxy_secret or None,
     )

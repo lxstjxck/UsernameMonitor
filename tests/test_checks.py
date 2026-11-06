@@ -54,6 +54,8 @@ class TestCheckCycle(unittest.IsolatedAsyncioTestCase):
             delay_seconds=0,
             bot_token="",
             chat_id="",
+            bot_proxy_url=None,
+            bot_proxy_secret=None,
             alert_first_free=True,
         )
         self.names_patch = patch("username_monitor.__main__.load_names", return_value=([NAME], []))
@@ -102,6 +104,15 @@ class TestCheckCycle(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(client.await_count, 2)
         self.assertEqual(self.store.summary()[0][1], "free")
         notify.assert_awaited_once()
+
+    async def test_failed_delivery_is_not_logged_as_success(self):
+        client = AsyncMock(return_value=True)
+        with patch("username_monitor.notify.notify", new_callable=AsyncMock, return_value=False) as notify:
+            with self.assertLogs("username_monitor", level="WARNING") as captured:
+                await one_cycle(client, self.config, self.store, 1)
+        self.assertEqual(self.store.summary()[0][1], "free")
+        notify.assert_awaited_once()
+        self.assertIn("уведомление не доставлено", " ".join(captured.output))
 
     async def test_flood_wait_stops_cycle_for_telegram_delay(self):
         client = AsyncMock(side_effect=errors.FloodWaitError(request=None, capture=700))
