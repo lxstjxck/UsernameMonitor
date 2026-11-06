@@ -10,6 +10,7 @@ from telethon import errors, functions
 CONNECT_TIMEOUT_SECONDS = 20
 AUTH_TIMEOUT_SECONDS = 15
 CONFIG_TIMEOUT_SECONDS = 15
+RESOLVE_TIMEOUT_SECONDS = 10
 DISCONNECT_TIMEOUT_SECONDS = 5
 
 USERNAME_RESPONSES = (
@@ -17,6 +18,7 @@ USERNAME_RESPONSES = (
     errors.UsernameOccupiedError,
     errors.UsernamePurchaseAvailableError,
 )
+RESOLVE_RESPONSES = (errors.UsernameNotOccupiedError, errors.UsernameInvalidError)
 
 
 def _safe_error(exc: Exception) -> str:
@@ -24,6 +26,8 @@ def _safe_error(exc: Exception) -> str:
         return "нет ответа в пределах тайм-аута"
     if isinstance(exc, errors.FloodWaitError):
         return f"Telegram требует паузу {exc.seconds} с"
+    if isinstance(exc, errors.UsernameNotOccupiedError):
+        return "имя не разрешено: username не занят"
     if isinstance(exc, errors.UsernameInvalidError):
         return "Telegram отклонил username"
     if isinstance(exc, errors.UsernameOccupiedError):
@@ -46,14 +50,14 @@ async def _stage(label, operation, timeout, describe, accepted_errors=()):
     except Exception as exc:
         elapsed = perf_counter() - started
         print(f"{label}: {elapsed:.2f} с; {type(exc).__name__}: {_safe_error(exc)}")
-        return isinstance(exc, accepted_errors), None
+        return isinstance(exc, accepted_errors), exc
     elapsed = perf_counter() - started
     print(f"{label}: {elapsed:.2f} с; {describe(result)}")
     return True, result
 
 
 async def diagnose(config, username: str, create_client) -> int:
-    """Probe connection, authorization, generic RPC and username RPC in order."""
+    """Compare read-only Telegram RPCs using the existing session."""
     session_file = Path(str(config.session_path))
     if session_file.suffix != ".session":
         session_file = Path(f"{session_file}.session")
@@ -81,18 +85,26 @@ async def diagnose(config, username: str, create_client) -> int:
                     AUTH_TIMEOUT_SECONDS,
                     lambda value: "авторизована" if value else "не авторизована",
                 )
-                config_ok, _ = await _stage(
+                config_ok, config_result = await _stage(
                     "help.GetConfigRequest", lambda: client(functions.help.GetConfigRequest()),
                     CONFIG_TIMEOUT_SECONDS, lambda _: "ответ получен",
                 )
-                username_ok, _ = await _stage(
-                    "account.CheckUsernameRequest",
-                    lambda: client(functions.account.CheckUsernameRequest(username=username)),
-                    config.check_timeout_seconds,
-                    lambda value: "ответ BoolTrue" if bool(value) else "ответ BoolFalse",
-                    accepted_errors=USERNAME_RESPONSES,
-                )
-                result_code = 0 if authorized and auth_value and config_ok and username_ok else 1
+                if not isinstance(config_result, errors.FloodWaitError):
+                    resolve_ok, resolve_result = await _stage(
+                        "contacts.ResolveUsernameRequest",
+                        lambda: client(functions.contacts.ResolveUsernameRequest(username=username)),
+                        RESOLVE_TIMEOUT_SECONDS, lambda _: "имя успешно разрешено",
+                        accepted_errors=RESOLVE_RESPONSES,
+                    )
+                    if not isinstance(resolve_result, errors.FloodWaitError):
+                        username_ok, _ = await _stage(
+                            "account.CheckUsernameRequest",
+                            lambda: client(functions.account.CheckUsernameRequest(username=username)),
+                            config.check_timeout_seconds,
+                            lambda value: "ответ BoolTrue" if bool(value) else "ответ BoolFalse",
+                            accepted_errors=USERNAME_RESPONSES,
+                        )
+                        result_code = 0 if authorized and auth_value and config_ok and resolve_ok and username_ok else 1
         finally:
             disconnected, _ = await _stage("disconnect", client.disconnect, DISCONNECT_TIMEOUT_SECONDS,
                                            lambda _: "отключено")

@@ -23,6 +23,7 @@ class FakeClient:
         self.is_user_authorized = AsyncMock(return_value=True)
         self.disconnect = AsyncMock()
         self.config_result = object()
+        self.resolve_result = object()
         self.username_result = True
 
     async def __call__(self, request):
@@ -33,6 +34,12 @@ class FakeClient:
             if asyncio.iscoroutine(self.config_result):
                 return await self.config_result
             return self.config_result
+        if isinstance(request, functions.contacts.ResolveUsernameRequest):
+            if isinstance(self.resolve_result, Exception):
+                raise self.resolve_result
+            if asyncio.iscoroutine(self.resolve_result):
+                return await self.resolve_result
+            return self.resolve_result
         if isinstance(self.username_result, Exception):
             raise self.username_result
         if asyncio.iscoroutine(self.username_result):
@@ -63,12 +70,16 @@ class TestDiagnose(unittest.IsolatedAsyncioTestCase):
         self.client.connect.assert_awaited_once()
         self.client.is_user_authorized.assert_awaited_once()
         self.assertIsInstance(self.client.calls[0], functions.help.GetConfigRequest)
-        self.assertIsInstance(self.client.calls[1], functions.account.CheckUsernameRequest)
+        self.assertIsInstance(self.client.calls[1], functions.contacts.ResolveUsernameRequest)
+        self.assertIsInstance(self.client.calls[2], functions.account.CheckUsernameRequest)
         self.assertEqual(self.client.calls[1].username, USERNAME)
+        self.assertEqual(self.client.calls[2].username, USERNAME)
         self.client.disconnect.assert_awaited_once()
         self.assertLess(output.index("connect:"), output.index("is_user_authorized:"))
         self.assertLess(output.index("is_user_authorized:"), output.index("help.GetConfigRequest:"))
-        self.assertLess(output.index("help.GetConfigRequest:"), output.index("account.CheckUsernameRequest:"))
+        self.assertLess(output.index("help.GetConfigRequest:"), output.index("contacts.ResolveUsernameRequest:"))
+        self.assertLess(output.index("contacts.ResolveUsernameRequest:"), output.index("account.CheckUsernameRequest:"))
+        self.assertIn("имя успешно разрешено", output)
         self.assertIn(" с;", output)
         self.assertNotIn(USERNAME, output)
         self.assertNotIn(str(self.config.session_path), output)
@@ -113,7 +124,7 @@ class TestDiagnose(unittest.IsolatedAsyncioTestCase):
         code, output = await self.run_diagnose()
         self.assertEqual(code, 1)
         self.assertIn("не авторизована", output)
-        self.assertEqual(len(self.client.calls), 2)
+        self.assertEqual(len(self.client.calls), 3)
 
     async def test_auth_timeout_does_not_block_later_probes(self):
         cancelled = asyncio.Event()
@@ -131,7 +142,7 @@ class TestDiagnose(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(cancelled.is_set())
         self.assertIn("is_user_authorized:", output)
         self.assertIn("TimeoutError", output)
-        self.assertEqual(len(self.client.calls), 2)
+        self.assertEqual(len(self.client.calls), 3)
 
     async def test_each_rpc_has_own_timeout_and_cancellation(self):
         cancelled = asyncio.Event()
@@ -167,6 +178,56 @@ class TestDiagnose(unittest.IsolatedAsyncioTestCase):
         self.assertIn("help.GetConfigRequest:", output)
         self.assertIn("account.CheckUsernameRequest:", output)
         self.assertIn("TimeoutError", output)
+
+    async def test_resolve_username_not_occupied_is_distinct_from_invalid(self):
+        for error_class, text in (
+            (errors.UsernameNotOccupiedError, "имя не разрешено"),
+            (errors.UsernameInvalidError, "Telegram отклонил username"),
+        ):
+            with self.subTest(error_class=error_class):
+                self.client.resolve_result = error_class(request=None)
+                code, output = await self.run_diagnose()
+                self.assertEqual(code, 0)
+                self.assertIn(error_class.__name__, output)
+                self.assertIn(text, output)
+                self.assertIn("account.CheckUsernameRequest:", output)
+                self.assertNotIn(USERNAME, output)
+
+    async def test_resolve_timeout_cancels_request_but_check_still_runs(self):
+        cancelled = asyncio.Event()
+
+        async def stalled():
+            try:
+                await asyncio.sleep(10)
+            finally:
+                cancelled.set()
+
+        self.client.resolve_result = stalled()
+        with patch("username_monitor.diagnostics.RESOLVE_TIMEOUT_SECONDS", 0.01):
+            code, output = await self.run_diagnose()
+        self.assertEqual(code, 1)
+        self.assertTrue(cancelled.is_set())
+        self.assertIn("contacts.ResolveUsernameRequest:", output)
+        self.assertIn("TimeoutError", output)
+        self.assertIn("account.CheckUsernameRequest:", output)
+
+    async def test_resolve_other_error_is_redacted(self):
+        self.client.resolve_result = errors.RPCError(request=None, message="private-token", code=400)
+        code, output = await self.run_diagnose()
+        self.assertEqual(code, 1)
+        self.assertIn("RPCError", output)
+        self.assertIn("Telegram вернул RPC-ошибку", output)
+        self.assertNotIn("private-token", output)
+        self.assertIn("account.CheckUsernameRequest:", output)
+
+    async def test_resolve_flood_wait_stops_before_check(self):
+        self.client.resolve_result = errors.FloodWaitError(request=None, capture=40)
+        code, output = await self.run_diagnose()
+        self.assertEqual(code, 1)
+        self.assertIn("FloodWaitError", output)
+        self.assertIn("40 с", output)
+        self.assertNotIn("account.CheckUsernameRequest:", output)
+        self.assertEqual(len(self.client.calls), 2)
 
     async def test_known_username_rpc_error_identifies_working_transport(self):
         self.client.username_result = errors.UsernameInvalidError(request=None)
