@@ -18,6 +18,7 @@ class Config:
     chat_id: str
     delay_seconds: float
     confirm_delay_seconds: float
+    check_timeout_seconds: float
     cycle_pause_seconds: float
     max_per_cycle: int
     alert_first_free: bool
@@ -69,6 +70,7 @@ def load_config() -> Config:
         chat_id=chat_id,
         delay_seconds=_float_env("CHECK_DELAY_SECONDS", 30, 5),
         confirm_delay_seconds=_float_env("CONFIRM_DELAY_SECONDS", 10, 5),
+        check_timeout_seconds=_float_env("CHECK_TIMEOUT_SECONDS", 30, 1),
         cycle_pause_seconds=_float_env("CYCLE_PAUSE_SECONDS", 600, 60),
         max_per_cycle=max_per_cycle,
         alert_first_free=os.getenv("ALERT_FIRST_FREE", "true").lower() in ("1", "true", "yes"),

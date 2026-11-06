@@ -14,6 +14,7 @@ from username_monitor.config import load_config
 
 SECRET = "a1" * 16
 BASE_ENV = {"TG_API_ID": "12345", "TG_API_HASH": "test-hash"}
+RETRY_OPTIONS = {"request_retries": 1, "connection_retries": 2, "retry_delay": 1}
 
 
 class TestProxyConfig(unittest.TestCase):
@@ -23,9 +24,10 @@ class TestProxyConfig(unittest.TestCase):
 
     def test_no_proxy_preserves_direct_connection(self):
         config = self.config()
+        self.assertEqual(config.check_timeout_seconds, 30)
         with patch("telethon.TelegramClient") as client_class:
             create_telegram_client(config)
-            client_class.assert_called_once_with(str(config.session_path), 12345, "test-hash")
+            client_class.assert_called_once_with(str(config.session_path), 12345, "test-hash", **RETRY_OPTIONS)
 
     def test_mtproxy_connection(self):
         config = self.config(TG_PROXY_HOST="proxy.example", TG_PROXY_PORT="443", TG_PROXY_SECRET="DD" + SECRET.upper())
@@ -36,6 +38,7 @@ class TestProxyConfig(unittest.TestCase):
                 connection=ConnectionTcpMTProxyRandomizedIntermediate,
                 proxy=("proxy.example", 443, "dd" + SECRET),
                 flood_sleep_threshold=0,
+                **RETRY_OPTIONS,
             )
         self.assertNotIn(SECRET, repr(config))
 
@@ -59,6 +62,7 @@ class TestProxyConfig(unittest.TestCase):
                 monitor_options = client_class.call_args_list[1].kwargs
                 self.assertEqual(login_options["connection"], monitor_options["connection"])
                 self.assertEqual(login_options["proxy"], monitor_options["proxy"])
+                self.assertEqual({key: login_options[key] for key in RETRY_OPTIONS}, RETRY_OPTIONS)
                 self.assertEqual(monitor_options["flood_sleep_threshold"], 0)
 
     def test_incomplete_proxy_configuration_is_rejected(self):
@@ -78,6 +82,12 @@ class TestProxyConfig(unittest.TestCase):
                 with self.assertRaises(ValueError) as result:
                     self.config(TG_PROXY_HOST="proxy.example", TG_PROXY_PORT="443", TG_PROXY_SECRET=secret)
                 self.assertNotIn(secret, str(result.exception))
+
+    def test_check_timeout_is_configurable_and_validated(self):
+        self.assertEqual(self.config(CHECK_TIMEOUT_SECONDS="2.5").check_timeout_seconds, 2.5)
+        for value in ("0", "-1", "86401"):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "CHECK_TIMEOUT_SECONDS"):
+                self.config(CHECK_TIMEOUT_SECONDS=value)
 
 
 if __name__ == "__main__":

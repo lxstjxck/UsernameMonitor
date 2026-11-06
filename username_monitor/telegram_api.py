@@ -9,14 +9,11 @@ async def check_username(client, name: str) -> tuple[str, str]:
         return ("free", "") if bool(value) else ("unavailable", "Telegram вернул BoolFalse")
     except errors.FloodWaitError:
         raise
-    except errors.RPCError as exc:
-        code = str(getattr(exc, "message", "")).upper()
-        mapping = {
-            "USERNAME_OCCUPIED": "occupied",
-            "USERNAME_PURCHASE_AVAILABLE": "fragment",
-            "USERNAME_INVALID": "invalid",
-        }
-        for marker, status in mapping.items():
-            if marker in code:
-                return status, code
-        raise  # Do not misreport API/network failures as 'occupied'.
+    except errors.UsernameInvalidError:
+        return "invalid", "USERNAME_INVALID"
+    except errors.UsernameOccupiedError:
+        return "occupied", "USERNAME_OCCUPIED"
+    except errors.UsernamePurchaseAvailableError:
+        return "fragment", "USERNAME_PURCHASE_AVAILABLE"
+    except errors.RPCError:
+        raise  # Unknown RPC failures are not availability results.

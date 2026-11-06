@@ -15,7 +15,7 @@ LOG = logging.getLogger("username_monitor")
 def create_telegram_client(config, *, flood_sleep_threshold=None):
     from telethon import TelegramClient
 
-    options = {}
+    options = {"request_retries": 1, "connection_retries": 2, "retry_delay": 1}
     if config.proxy_host is not None:
         from telethon.network.connection import ConnectionTcpMTProxyRandomizedIntermediate
 
@@ -52,11 +52,11 @@ async def one_cycle(client, config, store: Store, limit: int) -> float:
     LOG.info("Проверяем %d имён из %d (только чтение)", len(selected), len(names))
     for i, name in enumerate(selected):
         try:
-            status, note = await check_username(client, name)
+            status, note = await asyncio.wait_for(check_username(client, name), config.check_timeout_seconds)
             if status == "free":
                 # A second result reduces noisy one-off responses; still not a guarantee.
                 await asyncio.sleep(config.confirm_delay_seconds)
-                status, note = await check_username(client, name)
+                status, note = await asyncio.wait_for(check_username(client, name), config.check_timeout_seconds)
             previous, changed = store.record(name, status, note)
             LOG.info("@%s: %s%s", name, status, f" (было {previous})" if changed else "")
             if status == "free" and changed and (previous is not None or config.alert_first_free):
@@ -69,6 +69,10 @@ async def one_cycle(client, config, store: Store, limit: int) -> float:
             store.mark_error(name, "FloodWait")
             LOG.warning("FLOOD_WAIT: прекращаем цикл; следующий запуск не раньше чем через %.0f с", cooldown)
             return cooldown
+        except asyncio.TimeoutError:
+            store.mark_error(name, "TimeoutError")
+            LOG.warning("@%s: превышено время проверки; цикл остановлен", name)
+            return config.cycle_pause_seconds
         except Exception as exc:
             # Do not include raw exception messages (they may contain data).
             store.mark_error(name, type(exc).__name__)
