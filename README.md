@@ -94,7 +94,16 @@ sudo systemctl disable telegram-username-monitor
 .venv/bin/python -m username_monitor check   # выполнить один цикл
 .venv/bin/python -m username_monitor run     # циклы до Ctrl+C
 .venv/bin/python -m username_monitor status  # показать последние статусы
+.venv/bin/python -m username_monitor diagnose --username testusername12345  # диагностика MTProto RPC
 ```
+
+Команда `diagnose` использует существующий файл сессии и те же настройки MTProxy, что `check` и `run`. Она ничего не записывает в SQLite и не отправляет уведомления. Запускайте её из каталога проекта на VPS с настроенным `.env`:
+
+```bash
+.venv/bin/python -m username_monitor diagnose --username testusername12345
+```
+
+Отчёт показывает длительность подключения, `is_user_authorized()`, `help.GetConfigRequest`, `account.CheckUsernameRequest` и отключения. Имя, содержимое сессии и секреты в отчёт не включаются. Лимиты ожидания этапов: подключение 20 с, авторизация 15 с, `help.GetConfigRequest` 15 с, проверка имени — `CHECK_TIMEOUT_SECONDS` (по умолчанию 30 с), отключение 5 с. Если авторизация отвечает, а `help.GetConfigRequest` или проверка имени зависает, проблема проявляется на уровне RPC после подключения; один только обмен байтами через прокси не подтверждает успешный ответ Telegram. `UsernameInvalidError` или `UsernameOccupiedError` означают, что Telegram ответил на запрос, хотя имя не свободно. При `FloodWaitError` команда показывает требуемую паузу и не повторяет запрос.
 
 ### Надёжность проверок
 

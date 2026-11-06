@@ -6,7 +6,7 @@ import sys
 from pathlib import Path
 
 from .config import load_config
-from .names import load_names
+from .names import USERNAME_PATTERN, load_names
 from .store import Store
 
 LOG = logging.getLogger("username_monitor")
@@ -118,8 +118,9 @@ def show_status(db_path: Path) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Telegram username monitor (только проверка)")
-    parser.add_argument("command", choices=["login", "check", "run", "status"])
+    parser.add_argument("command", choices=["login", "check", "run", "status", "diagnose"])
     parser.add_argument("--limit", type=int, default=None, help="Количество имён за цикл (не более MAX_PER_CYCLE)")
+    parser.add_argument("--username", help="Имя для команды diagnose (не выводится в отчёте)")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     try:
@@ -130,6 +131,13 @@ def main() -> int:
             show_status(Path(os.getenv("DB_PATH", "data/monitor.sqlite3")))
             return 0
         config = load_config()
+        if args.command == "diagnose":
+            from .diagnostics import diagnose
+
+            name = (args.username or "").removeprefix("@").lower()
+            if not USERNAME_PATTERN.fullmatch(name):
+                parser.error("для diagnose укажите корректное имя через --username")
+            return asyncio.run(diagnose(config, name, create_telegram_client))
         limit = config.max_per_cycle if args.limit is None else args.limit
         if not (1 <= limit <= config.max_per_cycle):
             parser.error(f"--limit должен быть от 1 до {config.max_per_cycle}")
