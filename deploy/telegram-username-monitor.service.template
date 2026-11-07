@@ -1,5 +1,7 @@
+# Historical example only; the retired installer never installs this file.
+# For the existing service, follow deploy/faketls-only-production.md.
 [Unit]
-Description=Telegram Username Monitor (read-only)
+Description=Telegram Username Monitor (FakeTLS)
 Wants=network-online.target
 After=network-online.target
 
@@ -8,7 +10,8 @@ Type=simple
 User=__RUN_USER__
 Group=__RUN_GROUP__
 WorkingDirectory=__PROJECT_DIR__
-ExecStart=__PROJECT_DIR__/.venv/bin/python -m username_monitor run
+LoadCredential=mtproxy_secret_b64:/etc/username-monitor/mtproxy-secret.b64
+ExecStart=__PROJECT_DIR__/.venv/bin/python __PROJECT_DIR__/deploy/run-with-mtproxy-credential.py --mtproxy-host __MTPROXY_HOST__ --mtproxy-port __MTPROXY_PORT__ --session-path __SESSION_PATH__ --db-path __DB_PATH__ --usernames-path __USERNAMES_PATH__ run
 Restart=on-failure
 RestartSec=30
 TimeoutStopSec=20

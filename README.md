@@ -13,66 +13,35 @@
 
 ## Требования
 
-Debian/Ubuntu VPS, Python >= 3.10, `python3-venv`, Git, Telegram-аккаунт, API ID и API Hash с https://my.telegram.org. Для сообщений бота — токен от @BotFather и `CHAT_ID` (опционально). Для создания репозитория на Windows — Git и GitHub CLI (`gh`).
+Debian/Ubuntu VPS, Python 3.12, `python3-venv`, Git, авторизованная Telegram-сессия, API ID и API Hash с https://my.telegram.org, доступный FakeTLS MTProxy и защищённое окружение для EE/Base64-секрета. Для сообщений бота — токен от @BotFather и `CHAT_ID` (опционально). Для создания репозитория на Windows — Git и GitHub CLI (`gh`).
 
-## Быстрый запуск на VPS
+## Запуск на VPS
 
-```bash
-sudo apt update
-sudo apt install -y python3 python3-venv git
-# После публикации репозитория на GitHub:
-git clone https://github.com/lxstjxck/UsernameMonitor.git
-cd UsernameMonitor
-python3 -m venv .venv
-.venv/bin/python -m pip install -r requirements.txt
-cp .env.example .env
-chmod 600 .env
-mkdir -p data
-chmod 700 data
-nano .env
-nano usernames.txt
-.venv/bin/python -m username_monitor login
-.venv/bin/python -m username_monitor check
-.venv/bin/python -m username_monitor status
-```
+Для действующего `username-monitor.service` используйте [процедуру FakeTLS-only обновления](deploy/faketls-only-production.md). Она готовит отдельный checkout и venv, проверяет копию сессии, обновляет override и предусматривает откат. Не запускайте `login` или параллельный `check` с production-сессией. Файл `data/telegram.session` — ключ к аккаунту; храните его вне Git.
 
-В `.env` обязательны `TG_API_ID` и `TG_API_HASH`. В `usernames.txt` — **один кандидат на строку**, начиная с пяти символов; `@` необязателен. Примеры по умолчанию закомментированы, заполни файл сам. Для входа команда `login` попросит номер, код Telegram и при необходимости пароль 2FA. Не передавай их никому. Файл `data/telegram.session` — ключ к аккаунту; не выкладывай его в Git и не пересылай. Для работы через SSH первый вход удобно выполнить вручную.
+В `.env` обязательны `TG_API_ID` и `TG_API_HASH`. В `usernames.txt` — одно имя на строку, от пяти символов; `@` необязателен. `status` читает SQLite и не требует Telegram-конфигурации.
 
 ### MTProxy
 
-For a purchased EE/Base64 FakeTLS MTProxy, set `TG_TRANSPORT=faketls` and
-`TG_MTPROXY_HOST`, `TG_MTPROXY_PORT`, `TG_MTPROXY_SECRET_B64` in the
-process environment. On systemd, use the private `LoadCredential=` file
+Telegram RPCs always use FakeTLS. Set `TG_MTPROXY_HOST`, `TG_MTPROXY_PORT`
+and `TG_MTPROXY_SECRET_B64` in the process environment. On systemd, use the private `LoadCredential=` file
 and [credential runner](deploy/run-with-mtproxy-credential.py): it injects
 the secret into the application environment without placing its value in
 unit settings or command arguments. The last variable is read before the
 project `.env` is loaded; never write it to the project or Git.
 The FakeTLS TCP endpoint may differ from the Telegram DC address. The
 adapter keeps Telethon's DC ID and connects TCP to the MTProxy without SOCKS5.
-Set `TG_TRANSPORT=legacy` to restore the original `TG_PROXY_*` route (or
-direct TCP when it was not configured), or `TG_TRANSPORT=direct` for explicit
-direct TCP. The default is `legacy`. See
-[`deploy/faketls-rollout.md`](deploy/faketls-rollout.md) for an isolated
-install, session backup, authenticated read-only RPC smoke, deployment and
-rollback. The `verify-transport` command uses an SQLite backup of the
+Old `TG_TRANSPORT` and `TG_PROXY_*` values in an existing `.env` do not
+select a transport. Missing FakeTLS settings fail before any network request.
+The `verify-transport` command uses an SQLite backup of the
 existing session, never calls `login`, and does not change the original.
 For a full preflight, pass `--username testusername12345 --reconnect`:
 the one username result is stored in temporary SQLite without notifications,
 then a fresh connection requests Telegram config again. Add `--idle-probe`
 to measure a 25-second idle interval and a separate series of RPCs five
-seconds apart on a copied session, with production stopped. For the running
-`username-monitor.service`, follow [the idle lifecycle update](deploy/idle-lifecycle-update.md).
-Confirm the actual unit name on the VPS before using other rollout instructions.
-
-Для подключения Telethon через MTProxy заполните в `.env` все три параметра:
-
-```dotenv
-TG_PROXY_HOST=proxy.example
-TG_PROXY_PORT=443
-TG_PROXY_SECRET=0123456789abcdef0123456789abcdef
-```
-
-`TG_PROXY_PORT` должен быть целым числом от 1 до 65535. Секрет — 32 шестнадцатеричных символа; также поддерживается префикс `dd` перед ними. Если все три поля пусты, используется прямое подключение. Частично заполненная или некорректная конфигурация вызывает ошибку до подключения. Одинаковые параметры MTProxy используются для `login`, `check` и `run`; команда `status` не подключается к Telegram. Храните `.env` с секретом вне Git.
+seconds apart on a copied session, with production stopped. The current
+[production procedure](deploy/faketls-only-production.md) includes rollback.
+Never put `TG_MTPROXY_SECRET_B64` into `.env`, command arguments or Git.
 
 ### Уведомления
 
@@ -99,38 +68,17 @@ BOT_PROXY_SECRET=your-worker-secret
 
 ### Запуск 24/7 через systemd
 
-Устанавливай проект в каталог, который доступен Linux-пользователю, под которым будет работать сервис. `login` и тестовый `check` должны быть выполнены **тем же пользователем**, что запускает сервис. Если подключаешься по SSH как обычный (не root) пользователь и работал от его имени, можно использовать его же. Если входишь как root, создай отдельного пользователя и передай ему права на папку проекта до настройки `.env` и авторизации Telegram.
-
-```bash
-# Пример: проект уже установлен, .env настроен,
-# сессия авторизована под текущим НЕ-root SSH-пользователем.
-sudo bash deploy/install-systemd.sh "$(id -un)"
-sudo systemctl status telegram-username-monitor
-sudo journalctl -u telegram-username-monitor -f
-```
-
-Этот скрипт создаёт unit `telegram-username-monitor.service` и сразу запускает его. Для первого production-запуска FakeTLS на московском VPS используйте [отдельную инструкцию](deploy/first-production-systemd.md), создающую `username-monitor.service`. Для перехода уже работающего сервиса сначала определите фактическое имя unit и следуйте [плану развёртывания](deploy/faketls-rollout.md). Для остановки установленного скриптом unit:
-
-```bash
-sudo systemctl stop telegram-username-monitor
-sudo systemctl disable telegram-username-monitor
-```
+Текущая служба на московском VPS — `username-monitor.service`, пользователь `username-monitor`, с `LoadCredential` и override `idle-lifecycle.conf`. Установщик `deploy/install-systemd.sh` выведен из эксплуатации и не создаёт службы. Следуйте [проверяемой процедуре обновления](deploy/faketls-only-production.md); исторические инструкции оставлены только для контекста.
 
 ### Команды
 
-```bash
-.venv/bin/python -m username_monitor login   # создать пользовательскую сессию
-.venv/bin/python -m username_monitor check   # выполнить один цикл
-.venv/bin/python -m username_monitor run     # циклы до Ctrl+C
-.venv/bin/python -m username_monitor status  # показать последние статусы
-.venv/bin/python -m username_monitor diagnose --username testusername12345  # диагностика MTProto RPC
-```
-
-Команда `diagnose` использует существующий файл сессии и те же настройки MTProxy, что `check` и `run`. Она ничего не записывает в SQLite и не отправляет уведомления. Запускайте её из каталога проекта на VPS с настроенным `.env`:
-
-```bash
-.venv/bin/python -m username_monitor diagnose --username testusername12345
-```
+`check`, `run`, `diagnose` и `verify-transport` требуют FakeTLS-конфигурации.
+На VPS используйте credential runner и `LoadCredential` из
+[инструкции](deploy/faketls-only-production.md). `status` работает без
+секрета: `.venv/bin/python -m username_monitor status`. `verify-transport`
+сам создаёт копию сессии; `diagnose` работает с путём `SESSION_PATH`,
+поэтому для него задайте **отдельную копию** и остановите production-сервис.
+Не запускайте `check` или `diagnose` параллельно с ним.
 
 Отчёт показывает длительность подключения, `is_user_authorized()`, `help.GetConfigRequest`, `contacts.ResolveUsernameRequest`, `account.CheckUsernameRequest` и отключения. Имя, найденный peer, содержимое сессии и секреты в отчёт не включаются. Лимиты ожидания этапов: подключение 20 с, авторизация 15 с, `help.GetConfigRequest` 15 с, разрешение имени 10 с, проверка имени — `CHECK_TIMEOUT_SECONDS` (по умолчанию 30 с), отключение 5 с. Resolve выполняется перед Check, чтобы сравнить независимые ответы. Успешный Resolve означает, что имя удалось разрешить; `UsernameNotOccupiedError` означает, что разрешить его не удалось, но сам по себе не гарантирует доступность для назначения. `UsernameInvalidError`, `FloodWaitError`, `TimeoutError` и прочие ошибки показываются отдельно, без исходного текста исключения. Если авторизация и `help.GetConfigRequest` отвечают, а один из запросов имени зависает, проблема проявляется на уровне этого RPC после подключения. При `FloodWaitError` команда показывает требуемую паузу и не отправляет следующие запросы.
 
@@ -143,15 +91,6 @@ sudo systemctl disable telegram-username-monitor
 ### Настройки нагрузки
 
 Значения по умолчанию: `CHECK_DELAY_SECONDS=30` (между кандидатами), `CONFIRM_DELAY_SECONDS=10` (вторая проверка доступного имени), `MAX_PER_CYCLE=20`, `CYCLE_PAUSE_SECONDS=600` (между циклами). При большом списке кандидаты обходятся по очереди, старые проверки получают приоритет. Это **не** гарантированно безопасные лимиты — Telegram не публикует универсальную безопасную частоту. При `FLOOD_WAIT` монитор приостанавливается как минимум на указанное Telegram время + 60 секунд. Не увеличивай частоту агрессивно.
-
-### Публикация из архива на GitHub
-
-1. Распакуй архив и открой PowerShell в папке проекта.
-2. Установи [Git](https://git-scm.com/download/win) и [GitHub CLI](https://cli.github.com/).
-3. Выполни `gh auth login`, затем `./publish-to-github.ps1`.
-4. Скрипт создаст **приватный** `lxstjxck/TelegramUsernameMonitor` и отправит туда исходники. Проверяй, что `gh` вошёл под `lxstjxck`, а имя свободно. Если Git не знает автора, задай `git config --global user.name ...` и `git config --global user.email ...`.
-
-Для приватного репозитория на VPS потребуется настроить авторизованный GitHub-доступ (SSH-ключ / GitHub CLI) перед `git clone`; альтернативно можно сделать репозиторий публичным, но **без .env или .session**.
 
 ## Ограничения и ответственность
 

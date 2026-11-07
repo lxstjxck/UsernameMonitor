@@ -1,5 +1,9 @@
 # FakeTLS rollout on the Moscow VPS
 
+> **ARCHIVE — do not execute.** This predates the FakeTLS-only refactor and
+> the current `username-monitor.service` override. Use
+> [faketls-only-production.md](faketls-only-production.md) instead.
+
 The production switch below requires separate approval after preflight.
 Do not run `login`, `deploy/install-systemd.sh`, or another monitor process.
 Keep the old checkout and virtual environment for rollback. Never edit
@@ -114,7 +118,7 @@ command line:
 ```bash
 sudo systemd-run --wait --pipe --collect \
   -p "User=$RUN_USER" -p "WorkingDirectory=$CANDIDATE" \
-  "$CANDIDATE/.venv/bin/python" -c 'import asyncio,sys; from username_monitor.config import load_config; from username_monitor.notify import notify; c=load_config(); ok=asyncio.run(notify(c.bot_token,c.chat_id,"UsernameMonitor: тест доставки уведомлений, без проверки username",bot_proxy_url=c.bot_proxy_url,bot_proxy_secret=c.bot_proxy_secret)); sys.exit(0 if ok else 1)'
+  "$CANDIDATE/.venv/bin/python" -c 'import asyncio,os,sys; from dotenv import load_dotenv; from username_monitor.notify import notify; load_dotenv(); chat=os.getenv("CHAT_ID") or os.getenv("TG_CHAT_ID", ""); ok=asyncio.run(notify(os.getenv("BOT_TOKEN", ""),chat,"UsernameMonitor: тест доставки уведомлений, без проверки username",bot_proxy_url=os.getenv("BOT_PROXY_URL") or None,bot_proxy_secret=os.getenv("BOT_PROXY_SECRET") or None)); sys.exit(0 if ok else 1)'
 ```
 
 Require exit code 0 and receipt of the neutral message. Present these

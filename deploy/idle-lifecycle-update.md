@@ -1,5 +1,9 @@
 # Update the running username-monitor.service after idle reconnects
 
+> **ARCHIVE — do not execute.** This rollout is complete on release
+> `20be8d5`. Use [faketls-only-production.md](faketls-only-production.md)
+> for the next update; preserve the existing `idle-lifecycle.conf` for rollback.
+
 Run only after review, publication of the tested commit, and explicit approval
 for VPS changes. The running production release is `3f94425`; keep its checkout
 and venv. Do not run `login`, start a second monitor with the production

@@ -1,5 +1,8 @@
 # First production start: username-monitor.service
 
+> **ARCHIVE — do not execute.** The service already exists. Use
+> [faketls-only-production.md](faketls-only-production.md) for updates.
+
 This is the first installation of the UsernameMonitor unit on the Moscow VPS.
 It is **not** the rollout procedure for an already running monitor. Do not run
 these commands until the reviewed source commit is published and production
@@ -110,8 +113,7 @@ free-username message:
 ```bash
 sudo systemd-run --wait --pipe --collect \
   -p "User=$APP_USER" -p "WorkingDirectory=$RELEASE" \
-  -p Environment=TG_TRANSPORT=direct \
-  "$RELEASE/.venv/bin/python" -c 'import asyncio,sys; from username_monitor.config import load_config; from username_monitor.notify import notify; c=load_config(); ok=asyncio.run(notify(c.bot_token,c.chat_id,"UsernameMonitor: тест production-доставки, без проверки username",bot_proxy_url=c.bot_proxy_url,bot_proxy_secret=c.bot_proxy_secret)); sys.exit(0 if ok else 1)'
+  "$RELEASE/.venv/bin/python" -c 'import asyncio,os,sys; from dotenv import load_dotenv; from username_monitor.notify import notify; load_dotenv(); chat=os.getenv("CHAT_ID") or os.getenv("TG_CHAT_ID", ""); ok=asyncio.run(notify(os.getenv("BOT_TOKEN", ""),chat,"UsernameMonitor: тест production-доставки, без проверки username",bot_proxy_url=os.getenv("BOT_PROXY_URL") or None,bot_proxy_secret=os.getenv("BOT_PROXY_SECRET") or None)); sys.exit(0 if ok else 1)'
 ```
 
 Require exit 0 **and receipt** of the neutral message. No Worker settings,
@@ -175,7 +177,7 @@ If startup or smoke fails, stop and disable **only** UsernameMonitor. With
 no previous UsernameMonitor unit there is no unit to restart. Keep the old
 checkout and venv, both SQLite backups and the original session intact.
 Do not touch `flowseal.service`, restore a session automatically or switch
-to an unverified legacy/direct route.
+to an unverified route.
 
 ```bash
 sudo systemctl disable --now "$SERVICE"

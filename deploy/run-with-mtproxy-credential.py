@@ -30,7 +30,6 @@ def main() -> int:
         print("MTProxy credential unavailable", file=sys.stderr)
         return 1
     os.environ["TG_MTPROXY_SECRET_B64"] = secret
-    os.environ["TG_TRANSPORT"] = "faketls"
     os.environ["TG_MTPROXY_HOST"] = args.mtproxy_host
     os.environ["TG_MTPROXY_PORT"] = args.mtproxy_port
     for key, value in (("SESSION_PATH", args.session_path), ("DB_PATH", args.db_path),

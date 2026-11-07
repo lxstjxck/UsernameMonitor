@@ -14,18 +14,12 @@ LOG = logging.getLogger("username_monitor")
 
 def create_telegram_client(config, *, flood_sleep_threshold=None):
     from telethon import TelegramClient
+    from .faketls import connection_for_mtproxy
 
-    options = {"request_retries": 1, "connection_retries": 2, "retry_delay": 1}
-    if config.tg_transport == "faketls":
-        from .faketls import connection_for_mtproxy
-        options["connection"] = connection_for_mtproxy(
-            config.mtproxy_host, config.mtproxy_port, config.mtproxy_secret
-        )
-    elif config.tg_transport == "legacy" and config.proxy_host is not None:
-        from telethon.network.connection import ConnectionTcpMTProxyRandomizedIntermediate
-
-        options["connection"] = ConnectionTcpMTProxyRandomizedIntermediate
-        options["proxy"] = (config.proxy_host, config.proxy_port, config.proxy_secret)
+    options = {
+        "request_retries": 1, "connection_retries": 2, "retry_delay": 1,
+        "connection": connection_for_mtproxy(config.mtproxy_host, config.mtproxy_port, config.mtproxy_secret),
+    }
     if flood_sleep_threshold is not None:
         options["flood_sleep_threshold"] = flood_sleep_threshold
     return TelegramClient(str(config.session_path), config.api_id, config.api_hash, **options)

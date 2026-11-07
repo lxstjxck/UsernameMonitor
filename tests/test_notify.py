@@ -1,4 +1,5 @@
 import json
+import base64
 import os
 import socket
 import unittest
@@ -13,7 +14,9 @@ WORKER_URL = "https://username-monitor-proxy.svjack69.workers.dev"
 WORKER_SECRET = "worker-secret-for-test"
 BOT_TOKEN = "bot-token-for-test"
 MESSAGE = "private notification text"
-BASE_ENV = {"TG_API_ID": "12345", "TG_API_HASH": "test-hash"}
+BASE_ENV = {"TG_API_ID": "12345", "TG_API_HASH": "test-hash",
+            "TG_MTPROXY_HOST": "proxy.example", "TG_MTPROXY_PORT": "443",
+            "TG_MTPROXY_SECRET_B64": base64.b64encode(bytes.fromhex("ee" + "a1" * 16) + b"a.com").decode()}
 
 
 def response_context(status=200, body=b'{"ok":true}'):

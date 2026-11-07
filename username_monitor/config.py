@@ -25,15 +25,11 @@ class Config:
     cycle_pause_seconds: float
     max_per_cycle: int
     alert_first_free: bool
-    proxy_host: str | None = None
-    proxy_port: int | None = None
-    proxy_secret: str | None = field(default=None, repr=False)
+    mtproxy_host: str
+    mtproxy_port: int
+    mtproxy_secret: bytes = field(repr=False)
     bot_proxy_url: str | None = None
     bot_proxy_secret: str | None = field(default=None, repr=False)
-    tg_transport: str = "legacy"
-    mtproxy_host: str | None = None
-    mtproxy_port: int | None = None
-    mtproxy_secret: bytes | None = field(default=None, repr=False)
 
 
 def _float_env(key: str, default: float, min_value: float) -> float:
@@ -82,41 +78,23 @@ def load_config() -> Config:
     max_per_cycle = int(os.getenv("MAX_PER_CYCLE", "20"))
     if not 1 <= max_per_cycle <= 1000:
         raise ValueError("MAX_PER_CYCLE должен быть в диапазоне 1–1000")
-    proxy_host = os.getenv("TG_PROXY_HOST", "").strip()
-    raw_proxy_port = os.getenv("TG_PROXY_PORT", "").strip()
-    proxy_secret = os.getenv("TG_PROXY_SECRET", "").strip()
-    transport = os.getenv("TG_TRANSPORT", "legacy").strip().lower()
-    if transport not in ("legacy", "direct", "faketls"):
-        raise ValueError("TG_TRANSPORT должен быть legacy, direct или faketls")
-    if transport == "legacy" and any((proxy_host, raw_proxy_port, proxy_secret)) and not all((proxy_host, raw_proxy_port, proxy_secret)):
-        raise ValueError("Укажите TG_PROXY_HOST, TG_PROXY_PORT и TG_PROXY_SECRET вместе")
-    proxy_port = None
-    if transport == "legacy" and proxy_host:
-        if not raw_proxy_port.isdecimal() or not 1 <= int(raw_proxy_port) <= 65535:
-            raise ValueError("TG_PROXY_PORT должен быть целым числом от 1 до 65535")
-        proxy_port = int(raw_proxy_port)
-        if not re.fullmatch(r"(?:[0-9a-fA-F]{32}|[dD]{2}[0-9a-fA-F]{32})", proxy_secret):
-            raise ValueError("TG_PROXY_SECRET должен содержать 32 шестнадцатеричных символа или dd и ещё 32")
-        proxy_secret = proxy_secret.lower()
-    mtproxy_host = mtproxy_port = mtproxy_secret = None
-    if transport == "faketls":
-        mtproxy_host = os.getenv("TG_MTPROXY_HOST", "").strip()
-        raw_port = os.getenv("TG_MTPROXY_PORT", "").strip()
-        raw_secret = protected_mtproxy_secret.strip()
-        if not mtproxy_host or not raw_port or not raw_secret:
-            raise ValueError("Укажите TG_MTPROXY_HOST, TG_MTPROXY_PORT и TG_MTPROXY_SECRET_B64 вместе")
-        if not raw_port.isdecimal() or not 1 <= int(raw_port) <= 65535:
-            raise ValueError("TG_MTPROXY_PORT должен быть целым числом от 1 до 65535")
-        try:
-            mtproxy_secret = base64.b64decode(raw_secret, validate=True)
-        except (binascii.Error, ValueError):
-            raise ValueError("TG_MTPROXY_SECRET_B64 имеет неверный формат") from None
-        # Marker + 16-byte key + ASCII SNI. Never include source bytes in errors.
-        if len(mtproxy_secret) != 22 or mtproxy_secret[0] != 0xEE or not re.fullmatch(
-            rb"[A-Za-z0-9.-]{5}", mtproxy_secret[17:]
-        ):
-            raise ValueError("TG_MTPROXY_SECRET_B64 должен кодировать 22 байта EE FakeTLS")
-        mtproxy_port = int(raw_port)
+    mtproxy_host = os.getenv("TG_MTPROXY_HOST", "").strip()
+    raw_port = os.getenv("TG_MTPROXY_PORT", "").strip()
+    raw_secret = protected_mtproxy_secret.strip()
+    if not mtproxy_host or not raw_port or not raw_secret:
+        raise ValueError("Укажите TG_MTPROXY_HOST, TG_MTPROXY_PORT и TG_MTPROXY_SECRET_B64 вместе")
+    if not raw_port.isdecimal() or not 1 <= int(raw_port) <= 65535:
+        raise ValueError("TG_MTPROXY_PORT должен быть целым числом от 1 до 65535")
+    try:
+        mtproxy_secret = base64.b64decode(raw_secret, validate=True)
+    except (binascii.Error, ValueError):
+        raise ValueError("TG_MTPROXY_SECRET_B64 имеет неверный формат") from None
+    # Marker + 16-byte key + ASCII SNI. Never include source bytes in errors.
+    if len(mtproxy_secret) != 22 or mtproxy_secret[0] != 0xEE or not re.fullmatch(
+        rb"[A-Za-z0-9.-]{5}", mtproxy_secret[17:]
+    ):
+        raise ValueError("TG_MTPROXY_SECRET_B64 должен кодировать 22 байта EE FakeTLS")
+    mtproxy_port = int(raw_port)
     return Config(
         api_id=int(raw_id),
         api_hash=api_hash,
@@ -131,12 +109,8 @@ def load_config() -> Config:
         cycle_pause_seconds=_float_env("CYCLE_PAUSE_SECONDS", 600, 60),
         max_per_cycle=max_per_cycle,
         alert_first_free=os.getenv("ALERT_FIRST_FREE", "true").lower() in ("1", "true", "yes"),
-        proxy_host=(proxy_host or None) if transport == "legacy" else None,
-        proxy_port=proxy_port if transport == "legacy" else None,
-        proxy_secret=(proxy_secret or None) if transport == "legacy" else None,
         bot_proxy_url=bot_proxy_url.rstrip("/") or None,
         bot_proxy_secret=bot_proxy_secret or None,
-        tg_transport=transport,
         mtproxy_host=mtproxy_host,
         mtproxy_port=mtproxy_port,
         mtproxy_secret=mtproxy_secret,

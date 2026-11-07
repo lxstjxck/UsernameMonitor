@@ -32,51 +32,83 @@ def config(**values):
 
 
 class TestFakeTlsConfig(unittest.TestCase):
-    def test_valid_and_rollback_with_one_setting(self):
-        values = dict(TG_TRANSPORT="faketls", TG_MTPROXY_HOST="45.130.124.28",
+    def test_faketls_is_the_only_transport(self):
+        values = dict(TG_MTPROXY_HOST="45.130.124.28",
                       TG_MTPROXY_PORT="443", TG_MTPROXY_SECRET_B64=SECRET_B64)
         cfg = config(**values)
         self.assertEqual((cfg.mtproxy_host, cfg.mtproxy_port, cfg.mtproxy_secret),
                          ("45.130.124.28", 443, RAW_SECRET))
         self.assertNotIn(SECRET_B64, repr(cfg))
         self.assertNotIn("a.com", repr(cfg))
-        direct = config(**(values | {"TG_TRANSPORT": "direct"}))
+        for obsolete in ({"TG_TRANSPORT": "direct"}, {"TG_TRANSPORT": "legacy",
+                          "TG_PROXY_HOST": "old.example", "TG_PROXY_PORT": "443",
+                          "TG_PROXY_SECRET": "a1" * 16}):
+            with self.subTest(obsolete=tuple(obsolete)):
+                selected = config(**(values | obsolete))
+                with patch("telethon.TelegramClient") as client:
+                    create_telegram_client(selected)
+                self.assertTrue(issubclass(client.call_args.kwargs["connection"], TgNetConnectionTls))
+                self.assertNotIn("proxy", client.call_args.kwargs)
+
+    def test_old_settings_cannot_bypass_missing_faketls(self):
         with patch("telethon.TelegramClient") as client:
-            create_telegram_client(direct)
-            self.assertNotIn("connection", client.call_args.kwargs)
-            self.assertNotIn("proxy", client.call_args.kwargs)
-        legacy = config(**(values | {"TG_TRANSPORT": "legacy",
-                                    "TG_PROXY_HOST": "old.example", "TG_PROXY_PORT": "443",
-                                    "TG_PROXY_SECRET": "a1" * 16}))
-        with patch("telethon.TelegramClient") as client:
-            create_telegram_client(legacy)
-            self.assertEqual(client.call_args.kwargs["proxy"],
-                             ("old.example", 443, "a1" * 16))
+            for value in ("direct", "legacy"):
+                with self.subTest(value=value), self.assertRaisesRegex(ValueError, "TG_MTPROXY_SECRET_B64"):
+                    config(TG_TRANSPORT=value, TG_PROXY_HOST="old.example",
+                           TG_PROXY_PORT="443", TG_PROXY_SECRET="a1" * 16,
+                           TG_MTPROXY_HOST="45.130.124.28", TG_MTPROXY_PORT="443")
+            client.assert_not_called()
 
     def test_invalid_values_do_not_echo_secret(self):
         for secret in (SECRET_B64[:-1], "!", base64.b64encode(b"\xdd" + RAW_SECRET[1:]).decode(),
                        base64.b64encode(RAW_SECRET + b"x").decode(),
                        base64.b64encode(RAW_SECRET[:17] + b"\x00.com").decode()):
             with self.subTest(length=len(secret)), self.assertRaises(ValueError) as caught:
-                config(TG_TRANSPORT="faketls", TG_MTPROXY_HOST="proxy", TG_MTPROXY_PORT="443",
+                config(TG_MTPROXY_HOST="proxy", TG_MTPROXY_PORT="443",
                        TG_MTPROXY_SECRET_B64=secret)
             self.assertNotIn(secret, str(caught.exception))
         for values in ({"TG_MTPROXY_HOST": "proxy"},
                        {"TG_MTPROXY_HOST": "proxy", "TG_MTPROXY_PORT": "0"},
                        {"TG_MTPROXY_HOST": "proxy", "TG_MTPROXY_PORT": "abc"}):
             with self.subTest(values=values), self.assertRaises(ValueError):
-                config(TG_TRANSPORT="faketls", TG_MTPROXY_SECRET_B64=SECRET_B64, **values)
+                config(TG_MTPROXY_SECRET_B64=SECRET_B64, **values)
 
-    def test_missing_dependency_only_matters_when_selected(self):
-        cfg = config(TG_TRANSPORT="direct")
+    def test_missing_secret_fails_before_client_creation(self):
         with patch("telethon.TelegramClient") as client:
-            create_telegram_client(cfg)
-            self.assertEqual(client.call_count, 1)
+            with self.assertRaisesRegex(ValueError, "TG_MTPROXY_SECRET_B64"):
+                config(TG_MTPROXY_HOST="proxy", TG_MTPROXY_PORT="443")
+            client.assert_not_called()
+
+    def test_status_does_not_need_telegram_or_faketls_config(self):
+        with tempfile.TemporaryDirectory() as root, \
+                patch.dict(os.environ, {"DB_PATH": str(Path(root) / "not-created.sqlite3")}, clear=True), \
+                patch("sys.argv", ["username_monitor", "status"]), \
+                patch("username_monitor.__main__.load_config") as load, \
+                patch("username_monitor.__main__.create_telegram_client") as client, \
+                patch("dotenv.load_dotenv"), redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(main(), 0)
+        self.assertIn("База ещё не создана", output.getvalue())
+        load.assert_not_called()
+        client.assert_not_called()
+
+    def test_all_rpc_commands_fail_before_network_without_faketls(self):
+        for args in (("login",), ("check",), ("run",),
+                     ("diagnose", "--username", "testusername12345"),
+                     ("verify-transport",)):
+            with self.subTest(args=args), \
+                    patch.dict(os.environ, BASE | {"TG_TRANSPORT": "direct"}, clear=True), \
+                    patch("username_monitor.config.load_dotenv"), \
+                    patch("sys.argv", ["username_monitor", *args]), \
+                    patch("telethon.TelegramClient") as client, \
+                    self.assertLogs("username_monitor", level="ERROR") as logs:
+                self.assertEqual(main(), 1)
+                client.assert_not_called()
+                self.assertIn("TG_MTPROXY", " ".join(logs.output))
 
     def test_secret_in_project_dotenv_is_not_accepted(self):
         def project_dotenv(*args, **kwargs):
             os.environ["TG_MTPROXY_SECRET_B64"] = SECRET_B64
-        values = BASE | {"TG_TRANSPORT": "faketls", "TG_MTPROXY_HOST": "proxy",
+        values = BASE | {"TG_MTPROXY_HOST": "proxy",
                          "TG_MTPROXY_PORT": "443"}
         with patch.dict(os.environ, values, clear=True), \
                 patch("username_monitor.config.load_dotenv", side_effect=project_dotenv):
@@ -114,7 +146,7 @@ class TestFakeTlsConfig(unittest.TestCase):
 
 class TestAdapter(unittest.TestCase):
     def setUp(self):
-        self.cfg = config(TG_TRANSPORT="faketls", TG_MTPROXY_HOST="45.130.124.28",
+        self.cfg = config(TG_MTPROXY_HOST="45.130.124.28",
                           TG_MTPROXY_PORT="443", TG_MTPROXY_SECRET_B64=SECRET_B64)
 
     def test_dc_id_stays_telegram_dc_and_tcp_targets_mtproxy(self):
@@ -173,8 +205,7 @@ class TestSessionProbe(unittest.IsolatedAsyncioTestCase):
         with sqlite3.connect(self.original) as db:
             db.execute("CREATE TABLE sentinel (value TEXT)")
             db.execute("INSERT INTO sentinel VALUES ('authorized-session-placeholder')")
-        self.cfg = replace(config(TG_TRANSPORT="faketls",
-                                  TG_MTPROXY_HOST="45.130.124.28",
+        self.cfg = replace(config(TG_MTPROXY_HOST="45.130.124.28",
                                   TG_MTPROXY_PORT="443",
                                   TG_MTPROXY_SECRET_B64=SECRET_B64),
                            session_path=self.original)
