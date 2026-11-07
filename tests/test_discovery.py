@@ -17,7 +17,8 @@ from telethon import errors
 
 from username_monitor.__main__ import main, one_cycle
 from username_monitor.config import load_config
-from username_monitor.discovery import CandidatePool, generate_candidates, read_pool, score_name
+from username_monitor.discovery import (Candidate, CandidatePool, generate_candidates,
+                                        rank_batch, read_pool, score_name)
 from username_monitor.names import USERNAME_PATTERN
 from username_monitor.outbox import deliver_due
 from username_monitor.store import Store
@@ -80,6 +81,91 @@ class DiscoveryCase(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(score_name("xxxxxx", "startup"))
         with self.assertRaises(ValueError):
             generate_candidates(1001, seed=1)
+
+    async def test_quality_penalties_and_batch_similarity(self):
+        self.assertLess(score_name("finroova", "startup")[0], score_name("finrovia", "startup")[0])
+        self.assertLess(score_name("velrano", "startup")[0], score_name("verlano", "startup")[0])
+        self.assertLess(score_name("mirorora", "startup")[0], score_name("miravera", "startup")[0])
+        names = ["velnora", "vilnora", "soravex"]
+        ranked = rank_batch([Candidate(name, "startup", 90, "base") for name in names])
+        self.assertEqual([item.username for item in ranked[:2]], ["velnora", "soravex"])
+        self.assertLess(ranked[2].score, ranked[0].score)
+        self.assertIn("near=-", ranked[2].reason)
+        endings = rank_batch([Candidate(name, "startup", 90, "base") for name in
+                              ("miranora", "velnora", "solnora")])
+        self.assertLess(endings[-1].score, endings[0].score)
+        self.assertIn("ending=-", endings[-1].reason)
+
+    async def test_top_diversity_and_stable_seed(self):
+        a = generate_candidates(300, seed=42)
+        self.assertEqual(a, generate_candidates(300, seed=42))
+        self.assertEqual(Counter(item.category for item in a), {"startup": 210, "short": 90})
+        top_startup = sorted((item for item in a if item.category == "startup"),
+                             key=lambda item: (-item.score, item.username))[:10]
+        top_short = sorted((item for item in a if item.category == "short"),
+                           key=lambda item: (-item.score, item.username))[:10]
+        self.assertGreaterEqual(len({len(item.username) for item in top_startup}), 3)
+        self.assertGreaterEqual(len({item.username[-3:] for item in top_startup}), 7)
+        self.assertGreaterEqual(len({item.score for item in top_startup}), 3)
+        self.assertGreaterEqual(len({item.username[-3:] for item in top_short}), 7)
+        self.assertGreaterEqual(len({item.score for item in top_short}), 2)
+
+    async def test_explicit_rescore_only_unchecked_and_schema_migration(self):
+        with self.store() as store:
+            # Simulate an existing v1 pool, which has no score_version column.
+            store.db.executescript("""CREATE TABLE discovery_candidates (
+                username TEXT PRIMARY KEY, category TEXT, score INTEGER, reason TEXT,
+                generated_at TEXT, status TEXT, last_checked_at TEXT, result TEXT,
+                attempts INTEGER, excluded_reason TEXT, next_check_at TEXT);
+                INSERT INTO discovery_candidates VALUES
+                ('velnora','startup',97,'v1','2026-11-07','queued',NULL,NULL,0,NULL,NULL),
+                ('vilnora','startup',97,'v1','2026-11-07','queued',NULL,NULL,0,NULL,NULL),
+                ('finroova','startup',97,'checked-v1','2026-11-07','checked','2026-11-07','occupied',1,'definitive_result',NULL),
+                ('miravera','startup',97,'retry-v1','2026-11-07','retry','2026-11-07','timeout',1,NULL,NULL),
+                ('soravex','startup',97,'free-v1','2026-11-07','confirmed_free','2026-11-07','free',1,NULL,NULL);
+            """)
+            store.record("manual123", "free", alert_first_free=True)
+            before = {table: store.db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                      for table in ("state", "changes", "notification_outbox")}
+            pool = CandidatePool(store)
+            self.assertEqual(pool.rescore_unchecked(), 2)
+            self.assertEqual(pool.rescore_unchecked(), 0)
+            rows = {name: (score, reason, version) for name, score, reason, version in
+                    store.db.execute("SELECT username,score,reason,score_version FROM discovery_candidates")}
+            for name in ("finroova", "miravera", "soravex"):
+                self.assertEqual(rows[name], (97, {"finroova": "checked-v1", "miravera": "retry-v1",
+                                                   "soravex": "free-v1"}[name], 1))
+            for name in ("velnora", "vilnora"):
+                self.assertEqual(rows[name][2], 2)
+                self.assertIn("v2", rows[name][1])
+            self.assertLess(rows["vilnora"][0], rows["velnora"][0])
+            self.assertEqual(before, {table: store.db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                                      for table in before})
+            self.assertEqual(store.db.execute("PRAGMA integrity_check").fetchone()[0], "ok")
+
+    async def test_cli_top_and_explicit_rescore_no_telegram(self):
+        with self.store() as store:
+            CandidatePool(store).generate(40, seed=42, pool_size=40)
+            with store.db:
+                store.db.execute("UPDATE discovery_candidates SET score_version=1,score=97,reason='old'")
+        output = io.StringIO()
+        with patch.dict(os.environ, {"DB_PATH": str(self.path)}, clear=True), patch("dotenv.load_dotenv"), \
+                patch("username_monitor.__main__.load_config", side_effect=AssertionError("secret")), \
+                patch("username_monitor.__main__.create_telegram_client", side_effect=AssertionError("network")), \
+                patch("sys.argv", ["username_monitor", "candidates", "top"]), redirect_stdout(output):
+            self.assertEqual(main(), 0)
+        self.assertIn("TOP 10 startup:", output.getvalue())
+        self.assertIn("TOP 10 short:", output.getvalue())
+        self.assertEqual(output.getvalue().count("@"), 20)
+        output = io.StringIO()
+        with patch.dict(os.environ, {"DB_PATH": str(self.path)}, clear=True), patch("dotenv.load_dotenv"), \
+                patch("username_monitor.__main__.load_config", side_effect=AssertionError("secret")), \
+                patch("username_monitor.__main__.create_telegram_client", side_effect=AssertionError("network")), \
+                patch("sys.argv", ["username_monitor", "candidates", "rescore"]), redirect_stdout(output):
+            self.assertEqual(main(), 0)
+        self.assertIn("Переоценено непроверенных кандидатов: 40", output.getvalue())
+        text = read_pool(self.path, action="top", top=10)
+        self.assertIn("v2", text)
 
     async def test_config_defaults_and_hard_limits(self):
         secret = base64.b64encode(bytes.fromhex("ee" + "a1" * 16) + b"a.com").decode()

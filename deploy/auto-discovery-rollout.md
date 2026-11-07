@@ -86,8 +86,44 @@ PY
 sudo -u "$APP_USER" env DB_PATH="$MIGRATION_COPY" \
   .venv/bin/python -m username_monitor candidates status
 sudo -u "$APP_USER" env DB_PATH="$MIGRATION_COPY" \
+  .venv/bin/python -m username_monitor candidates top
+sudo -u "$APP_USER" env DB_PATH="$MIGRATION_COPY" \
   .venv/bin/python -m username_monitor metrics-status --hours 24 --json
 ```
+
+Если на копии уже есть Candidate Pool версии v1, запустите явную переоценку
+только на `MIGRATION_COPY`, затем сравните все уже проверенные строки с
+неизменённым backup. Команда не должна менять историю, Outbox или метрики:
+
+```bash
+sudo -u "$APP_USER" env DB_PATH="$MIGRATION_COPY" \
+  .venv/bin/python -m username_monitor candidates rescore
+sudo -u "$APP_USER" .venv/bin/python - "$DB_BACKUP" "$MIGRATION_COPY" <<'PY'
+import sqlite3, sys
+from pathlib import Path
+from contextlib import closing
+old, candidate = map(Path, sys.argv[1:])
+def inspected(path):
+    with closing(sqlite3.connect(path.resolve().as_uri() + '?mode=ro', uri=True)) as db:
+        assert db.execute('PRAGMA integrity_check').fetchone()[0] == 'ok'
+        tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        checked = db.execute("""SELECT username,status,attempts,last_checked_at,score,reason
+            FROM discovery_candidates WHERE status!='queued' OR attempts>0 OR last_checked_at IS NOT NULL
+            ORDER BY username""").fetchall() if 'discovery_candidates' in tables else []
+        counts = {name: db.execute(f'SELECT COUNT(*) FROM {name}').fetchone()[0]
+                  for name in ('state','changes','notification_outbox',
+                               'rpc_metrics','delivery_metrics','cycle_metrics') if name in tables}
+        return checked, counts
+assert inspected(old) == inspected(candidate)
+print('DISCOVERY_RESCORE_COPY_OK')
+PY
+sudo -u "$APP_USER" env DB_PATH="$MIGRATION_COPY" \
+  .venv/bin/python -m username_monitor candidates top
+```
+
+Команда рескоринга явная: запуск нового release **не** меняет оценки
+существующих строк автоматически. Не запускайте её на рабочей базе при
+работающей службе.
 
 Для авторизованной проверки только **копии** сессии используйте прежний
 credential runner, пока unit остановлен; требуются PASS `get_me` и

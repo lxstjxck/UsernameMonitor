@@ -112,9 +112,23 @@ DB_PATH=/opt/username-monitor/data/monitor.sqlite3 .venv/bin/python -m username_
 ```bash
 DB_PATH=data/monitor.sqlite3 python -m username_monitor candidates generate --count 300 --seed 42
 DB_PATH=data/monitor.sqlite3 python -m username_monitor candidates list --top 20
+DB_PATH=data/monitor.sqlite3 python -m username_monitor candidates top
 DB_PATH=data/monitor.sqlite3 python -m username_monitor candidates list --category short --state queued
 DB_PATH=data/monitor.sqlite3 python -m username_monitor candidates status
 ```
+
+`candidates top` отдельно показывает TOP 10 startup и TOP 10 short;
+`--top N` меняет размер каждой группы. Версия рейтинга v2 использует несколько
+структур имён и штрафует неестественные стыки, повтор гласных и слогов,
+сложные буквы и слишком похожие имена или окончания в подборке. Одинаковые
+баллы допустимы. Seed воспроизводит генерацию при одинаковом состоянии пула.
+Для кандидатов, созданных до v2, команда
+`python -m username_monitor candidates rescore` переоценивает **только**
+`queued` с `attempts=0` и пустым `last_checked_at`. Она не меняет уже
+проверенные, временно отложенные и подтверждённые имена, Outbox, историю или
+Telegram RPC. Сначала проверьте результат на копии базы, следуя
+[инструкции обновления](deploy/auto-discovery-rollout.md); на рабочем VPS не
+запускайте запись в Candidate Pool одновременно с монитором.
 
 `generate` пишет только Candidate Pool в SQLite, не вызывает Telegram и не
 меняет `usernames.txt`. `list` и `status` читают SQLite read-only, без

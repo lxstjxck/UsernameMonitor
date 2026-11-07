@@ -16,10 +16,22 @@ START = ("vel", "nex", "zen", "lum", "nov", "ver", "sol", "riv", "kor", "tek",
          "lin", "mon", "cal", "ser", "vin", "tor", "len", "nav")
 MIDDLE = ("a", "e", "i", "o", "u", "ra", "la", "vi", "no", "mi", "ro", "za", "ne", "lu")
 END = ("ra", "na", "vo", "lo", "ia", "io", "or", "is", "um", "ex", "en", "ix",
-       "ora", "iva", "ena", "aro", "ova", "era", "iro", "ula")
+       "ora", "iva", "ena", "aro", "ova", "era", "iro", "ula", "ari", "yne",
+       "elo", "uno", "ium", "ael", "evo", "ale", "ani", "oli")
+PREFIX = ("va", "ne", "zo", "ki", "ma", "lo", "re", "se", "vi", "ta", "no", "lu", "el", "ora",
+          "vio", "ava", "mio", "sora")
+CORE = ("lumi", "nora", "viro", "sena", "vera", "tali", "mira", "lora", "fino",
+        "riva", "zori", "vexa", "nivo", "kora", "lena", "tora", "melo", "nova")
+TAIL = ("a", "o", "i", "en", "ix", "on", "um", "io", "el", "ia", "ar", "is")
 UNWANTED = ("xxx", "qq", "jj", "fuck", "porn", "shit", "nazi")
 STATES = ("queued", "checking", "checked", "confirmed_free", "discarded", "retry")
 CATEGORIES = ("startup", "short")
+SCORE_VERSION = 2
+# Uncomfortable joins are penalized, while ordinary clusters such as br/tr/st
+# are allowed. This is a heuristic for Latin-letter brand names, not a dictionary.
+AWKWARD_PAIRS = {"lr": 5, "nr": 5, "nl": 5, "nm": 4, "lv": 4, "rv": 3,
+                 "vx": 6, "xv": 7, "xl": 5, "xr": 5, "xj": 8, "hz": 7,
+                 "jh": 7, "tj": 6, "jd": 7, "gz": 5, "zr": 4, "yk": 4}
 
 
 @dataclass(frozen=True)
@@ -43,32 +55,115 @@ def score_name(name: str, category: str) -> tuple[int, str] | None:
     ratio = vowels / len(name)
     if not .25 <= ratio <= .65:
         return None
-    target = 8 if category == "startup" else 5.5
-    length = max(0, 28 - 5 * abs(len(name) - target))
-    flow = 25 if max(runs, default=0) <= 2 else 12
-    memorability = min(20, len(set(name)) * 3)
-    vowel_balance = max(0, 17 - int(abs(ratio - .42) * 40))
+    if category == "startup":
+        length = 18 if 7 <= len(name) <= 9 else (15 if len(name) in (6, 10) else 8)
+    else:
+        length = 21 if len(name) == 5 else (17 if len(name) == 6 else 8)
+    memorability = min(12, round(len(set(name)) * 1.7))
+    vowel_balance = max(0, 13 - round(abs(ratio - .42) * 36))
+    transitions = sum((name[i] in VOWELS) != (name[i + 1] in VOWELS)
+                      for i in range(len(name) - 1))
+    flow = round(12 * transitions / (len(name) - 1))
+    bigrams = min(8, len({name[i:i + 2] for i in range(len(name) - 1)}))
     category_fit = 10 if (6 <= len(name) <= 10 if category == "startup" else 5 <= len(name) <= 6) else 0
-    score = min(100, max(0, round(length + flow + memorability + vowel_balance + category_fit)))
-    return score, (f"length={len(name)}; vowel_balance={vowel_balance}; flow={flow}; "
-                   f"memorability={memorability}; category_fit={category_fit}")
+    joins = sum(AWKWARD_PAIRS.get(name[i:i + 2], 0) for i in range(len(name) - 1))
+    joins += sum(3 for i in range(len(name) - 1) if name[i] == name[i + 1] and name[i] not in VOWELS)
+    repeated_vowels = sum(10 if name[i:i + 2] in ("oo", "ii") else 5
+                          for i in range(len(name) - 1) if name[i] == name[i + 1] and name[i] in VOWELS)
+    repeated_syllables = sum(7 for i in range(len(name) - 3)
+                             if name[i:i + 2] == name[i + 2:i + 4])
+    rare_letters = sum(3 if char in "qjx" else 2 for char in name if char in "qjxwy")
+    soft_sounds = min(4, sum(char in "lrmnv" for char in name))
+    ending = 2 if name[-1] in "aeo" else (1 if name[-1] in "nlr" else 0)
+    penalties = joins + repeated_vowels + repeated_syllables + rare_letters
+    score = min(100, max(0, 20 + length + flow + memorability + vowel_balance + bigrams +
+                        category_fit + soft_sounds + ending - penalties))
+    return score, (f"v{SCORE_VERSION} length={len(name)}; vowel_balance={vowel_balance}; "
+                   f"flow={flow}; memorability={memorability}; bigrams={bigrams}; "
+                   f"category_fit={category_fit}; soft_sounds={soft_sounds}; ending={ending}; "
+                   f"joins=-{joins}; repeated_vowels=-{repeated_vowels}; "
+                   f"repeated_syllables=-{repeated_syllables}; rare_letters=-{rare_letters}")
 
 
-def generate_candidates(count: int, seed: int | None = None) -> list[Candidate]:
+def _similarity(a: str, b: str) -> int:
+    penalty = 0
+    if a[-4:] == b[-4:]:
+        penalty += 8
+    elif a[-3:] == b[-3:]:
+        penalty += 5
+    if a[:4] == b[:4]:
+        penalty += 5
+    if len(a) == len(b):
+        distance = sum(left != right for left, right in zip(a, b))
+        if distance <= 2:
+            penalty += 12 if distance == 1 else 7
+    return penalty
+
+
+def rank_batch(candidates: list[Candidate], peers=(), *, limit: int | None = None) -> list[Candidate]:
+    """Greedy quality ranking with a bounded penalty for near neighbors.
+
+    Scores are committed when selected; later candidates cannot retroactively
+    change an earlier candidate's score. Existing processed rows are untouched.
+    """
+    remaining = list(candidates)
+    ranked: list[Candidate] = []
+    neighbors = [0] * len(remaining)
+    existing = tuple(peers)
+    suffixes: dict[str, int] = {}
+    for peer in existing:
+        suffixes[peer[-2:]] = suffixes.get(peer[-2:], 0) + 1
+    for index, candidate in enumerate(remaining):
+        neighbors[index] = max((_similarity(candidate.username, peer) for peer in existing), default=0)
+    while remaining and (limit is None or len(ranked) < limit):
+        best = max(range(len(remaining)), key=lambda i: (
+            remaining[i].score - neighbors[i] - min(7, suffixes.get(remaining[i].username[-2:], 0)),
+            remaining[i].score, -i))
+        selected = remaining.pop(best)
+        near = neighbors.pop(best)
+        suffix = selected.username[-2:]
+        crowd = min(7, suffixes.get(suffix, 0))
+        ranked.append(Candidate(selected.username, selected.category,
+                                max(0, selected.score - near - crowd),
+                                f"{selected.reason}; near=-{near}; ending=-{crowd}"))
+        suffixes[suffix] = suffixes.get(suffix, 0) + 1
+        for index, candidate in enumerate(remaining):
+            neighbors[index] = max(neighbors[index], _similarity(candidate.username, selected.username))
+    return ranked
+
+
+def _startup_name(rng: random.Random) -> str:
+    template = rng.randrange(6)
+    if template == 0:
+        return rng.choice(START) + rng.choice(MIDDLE) + rng.choice(END)
+    if template == 1:
+        return rng.choice(START) + rng.choice(END)
+    if template == 2:
+        return rng.choice(PREFIX) + rng.choice(CORE) + rng.choice(TAIL)
+    if template == 3:
+        return rng.choice(CORE) + rng.choice(END)
+    if template == 4:
+        return rng.choice(PREFIX) + rng.choice(CORE)
+    return rng.choice(CORE) + rng.choice(MIDDLE[5:]) + rng.choice(END[12:])
+
+
+def generate_candidates(count: int, seed: int | None = None, *, peers=()) -> list[Candidate]:
     """Exactly 70/30 startup/short for multiples of ten; fixed iteration cap."""
     if not 1 <= count <= 1000:
         raise ValueError("Количество кандидатов должно быть от 1 до 1000")
     rng = random.Random(seed if seed is not None else secrets.randbits(64))
     result: list[Candidate] = []
-    seen: set[str] = set()
+    existing = tuple(peers)
+    seen: set[str] = set(existing)
     startup_target = round(count * .7)
     for category, target in (("startup", startup_target), ("short", count - startup_target)):
-        produced = 0
-        for _ in range(max(100, target * 100)):
-            if produced >= target:
+        options: list[Candidate] = []
+        option_target = min(4000, max(target * 4, target + 20))
+        for _ in range(max(100, option_target * 40)):
+            if len(options) >= option_target:
                 break
             if category == "startup":
-                name = rng.choice(START) + rng.choice(MIDDLE) + rng.choice(END)
+                name = _startup_name(rng)
             else:
                 # Five or six letters, with one optional terminal consonant.
                 name = "".join((rng.choice(CONSONANTS), rng.choice(VOWELS),
@@ -80,10 +175,10 @@ def generate_candidates(count: int, seed: int | None = None) -> list[Candidate]:
             if rating is None or name in seen or rating[0] < 55:
                 continue
             seen.add(name)
-            result.append(Candidate(name, category, *rating))
-            produced += 1
-        if produced != target:
+            options.append(Candidate(name, category, *rating))
+        if len(options) < target:
             raise RuntimeError("Не удалось создать достаточное число кандидатов в лимите генерации")
+        result.extend(rank_batch(options, peers=existing, limit=target))
     return result
 
 
@@ -104,7 +199,8 @@ class CandidatePool:
                 result TEXT,
                 attempts INTEGER NOT NULL DEFAULT 0,
                 excluded_reason TEXT,
-                next_check_at TEXT
+                next_check_at TEXT,
+                score_version INTEGER NOT NULL DEFAULT 2
             );
             CREATE INDEX IF NOT EXISTS idx_discovery_queue
                 ON discovery_candidates(status,score DESC,next_check_at);
@@ -113,6 +209,9 @@ class CandidatePool:
             );
             CREATE INDEX IF NOT EXISTS idx_discovery_attempts_started ON discovery_attempts(started_at);
         """)
+        if "score_version" not in {row[1] for row in self.db.execute("PRAGMA table_info(discovery_candidates)")}:
+            self.db.execute("ALTER TABLE discovery_candidates ADD COLUMN score_version INTEGER NOT NULL DEFAULT 1")
+            self.db.commit()
         self._has_state = bool(self.db.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='state'").fetchone())
 
@@ -128,11 +227,14 @@ class CandidatePool:
         if count == 0:
             return 0
         added = 0
+        peers = [row[0] for row in self.db.execute("""SELECT username FROM discovery_candidates
+            WHERE status IN ('queued','retry','checking','confirmed_free')""")]
         # Fixed work bound even when names were generated in an earlier run.
         for round_no in range(12):
             if added >= count:
                 break
-            candidates = generate_candidates(count - added, None if seed is None else seed + round_no)
+            candidates = generate_candidates(count - added, None if seed is None else seed + round_no,
+                                             peers=peers)
             with self.db:
                 self.db.execute("BEGIN IMMEDIATE")
                 available = max(0, pool_size - self.db.execute("""SELECT COUNT(*) FROM discovery_candidates
@@ -144,13 +246,39 @@ class CandidatePool:
                             "SELECT 1 FROM state WHERE username=?", (candidate.username,)).fetchone():
                         continue
                     cursor = self.db.execute("""INSERT OR IGNORE INTO discovery_candidates
-                        (username,category,score,reason,generated_at,status) VALUES (?,?,?,?,?,'queued')""",
-                        (candidate.username, candidate.category, candidate.score, candidate.reason, self.now()))
+                        (username,category,score,reason,generated_at,status,score_version)
+                        VALUES (?,?,?,?,?,'queued',?)""",
+                        (candidate.username, candidate.category, candidate.score, candidate.reason, self.now(),
+                         SCORE_VERSION))
                     added += cursor.rowcount
                     available -= cursor.rowcount
+                    if cursor.rowcount:
+                        peers.append(candidate.username)
             if available == 0:
                 break
         return added
+
+    def rescore_unchecked(self) -> int:
+        """Explicit migration of never-started queued rows only; history stays intact."""
+        with self.db:
+            self.db.execute("BEGIN IMMEDIATE")
+            rows = self.db.execute("""SELECT username,category FROM discovery_candidates
+                WHERE status='queued' AND attempts=0 AND last_checked_at IS NULL AND score_version<?
+                ORDER BY generated_at,username""", (SCORE_VERSION,)).fetchall()
+            candidates = []
+            for name, category in rows:
+                rating = score_name(name, category)
+                if rating is not None:
+                    candidates.append(Candidate(name, category, *rating))
+            peers = [row[0] for row in self.db.execute("""SELECT username FROM discovery_candidates
+                WHERE status IN ('checking','retry','confirmed_free')
+                   OR (status='queued' AND score_version>=?)""", (SCORE_VERSION,))]
+            for candidate in rank_batch(candidates, peers=peers):
+                self.db.execute("""UPDATE discovery_candidates SET score=?,reason=?,score_version=?
+                    WHERE username=? AND status='queued' AND attempts=0 AND last_checked_at IS NULL
+                      AND score_version<?""",
+                    (candidate.score, candidate.reason, SCORE_VERSION, candidate.username, SCORE_VERSION))
+        return len(candidates)
 
     def fill(self, pool_size: int):
         active = self.db.execute("""SELECT COUNT(*) FROM discovery_candidates
@@ -254,6 +382,15 @@ def read_pool(path: Path, *, action: str, top: int = 20, category: str | None = 
                     f"daily_remaining: {max(0,daily_limit-used)}")
         if not 1 <= top <= 1000:
             raise ValueError("--top должен быть от 1 до 1000")
+        if action == "top":
+            groups = []
+            for cat in CATEGORIES:
+                rows = db.execute("""SELECT username,score,status,reason FROM discovery_candidates
+                    WHERE category=? ORDER BY score DESC,username LIMIT ?""", (cat, top)).fetchall()
+                groups.append(f"TOP {top} {cat}:\n" + ("\n".join(
+                    f"@{name} score={score} {state} {reason}" for name, score, state, reason in rows)
+                    or "no data"))
+            return "\n\n".join(groups)
         rows = db.execute("""SELECT username,category,score,status,reason FROM discovery_candidates
             WHERE (? IS NULL OR category=?) AND (? IS NULL OR status=?)
             ORDER BY score DESC,username LIMIT ?""", (category, category, status, status, top)).fetchall()

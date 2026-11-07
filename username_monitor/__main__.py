@@ -224,7 +224,7 @@ def show_notifications_status(db_path: Path) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description="Telegram username monitor (только проверка)")
     parser.add_argument("command", choices=["login", "check", "run", "status", "notifications-status", "metrics-status", "candidates", "diagnose", "verify-transport"])
-    parser.add_argument("candidate_action", nargs="?", choices=["generate", "list", "status"])
+    parser.add_argument("candidate_action", nargs="?", choices=["generate", "list", "top", "status", "rescore"])
     parser.add_argument("--limit", type=int, default=None, help="Количество имён за цикл (не более MAX_PER_CYCLE)")
     parser.add_argument("--username", help="Имя для diagnose или verify-transport (не выводится в отчёте)")
     parser.add_argument("--reconnect", action="store_true", help="Принудительный reconnect в verify-transport")
@@ -233,7 +233,7 @@ def main() -> int:
     parser.add_argument("--json", action="store_true", help="JSON-отчёт metrics-status")
     parser.add_argument("--count", type=int, default=300, help="Количество кандидатов для генерации")
     parser.add_argument("--seed", type=int, help="Seed для воспроизводимой генерации")
-    parser.add_argument("--top", type=int, default=20, help="Количество строк candidates list")
+    parser.add_argument("--top", type=int, default=None, help="Количество строк candidates list/top")
     parser.add_argument("--category", choices=["startup", "short"], help="Фильтр категории candidates list")
     parser.add_argument("--state", choices=["queued", "checking", "checked", "confirmed_free", "discarded", "retry"],
                         help="Фильтр состояния candidates list")
@@ -243,7 +243,7 @@ def main() -> int:
         if args.idle_probe and args.command != "verify-transport":
             parser.error("--idle-probe доступен только для verify-transport")
         if args.command == "candidates" and args.candidate_action is None:
-            parser.error("для candidates укажите generate, list или status")
+            parser.error("для candidates укажите generate, list, top, status или rescore")
         if args.command != "candidates" and args.candidate_action is not None:
             parser.error("действие candidates доступно только для candidates")
         if args.command in ("status", "notifications-status", "metrics-status", "candidates"):
@@ -253,7 +253,7 @@ def main() -> int:
             db_path = Path(os.getenv("DB_PATH", "data/monitor.sqlite3"))
             if args.command == "candidates":
                 from .discovery import CandidatePool, read_pool
-                if args.candidate_action == "generate":
+                if args.candidate_action in ("generate", "rescore"):
                     import sqlite3
                     from types import SimpleNamespace
                     pool_size = int(os.getenv("AUTO_DISCOVERY_POOL_SIZE", "300"))
@@ -262,10 +262,15 @@ def main() -> int:
                     db_path.parent.mkdir(parents=True, exist_ok=True)
                     with sqlite3.connect(db_path) as db:
                         pool = CandidatePool(SimpleNamespace(db=db, clock=lambda: datetime.now(timezone.utc)))
-                        added = pool.generate(args.count, seed=args.seed, pool_size=pool_size)
-                    print(f"Добавлено кандидатов: {added}")
+                        if args.candidate_action == "generate":
+                            added = pool.generate(args.count, seed=args.seed, pool_size=pool_size)
+                            print(f"Добавлено кандидатов: {added}")
+                        else:
+                            changed = pool.rescore_unchecked()
+                            print(f"Переоценено непроверенных кандидатов: {changed}")
                 else:
-                    print(read_pool(db_path, action=args.candidate_action, top=args.top,
+                    print(read_pool(db_path, action=args.candidate_action,
+                                    top=args.top if args.top is not None else (10 if args.candidate_action == "top" else 20),
                                     category=args.category, status=args.state,
                                     daily_limit=int(os.getenv("AUTO_DISCOVERY_DAILY_LIMIT", "12"))))
             elif args.command == "status":
