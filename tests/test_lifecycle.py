@@ -220,7 +220,7 @@ class TestOnDemandLifecycle(unittest.IsolatedAsyncioTestCase):
         client = SessionClient()
         pauses = []
 
-        async def stop_after_pause(_config, _store, seconds):
+        async def stop_after_pause(_config, _store, seconds, *, telemetry=None):
             pauses.append(seconds)
             self.assertFalse(client.active)
             raise asyncio.CancelledError()

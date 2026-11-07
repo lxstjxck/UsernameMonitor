@@ -3,11 +3,14 @@ import argparse
 import asyncio
 import logging
 import sys
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 from .config import load_config
 from .names import USERNAME_PATTERN, load_names
 from .store import Store
+from .telemetry import Telemetry, safe_record
 
 LOG = logging.getLogger("username_monitor")
 
@@ -55,9 +58,36 @@ async def login(config) -> None:
         await client.disconnect()
 
 
-async def one_cycle(client, config, store: Store, limit: int) -> float:
+async def _check_measured(client, name, timeout, phase, telemetry, *, monotonic=time.monotonic):
     from telethon import errors
     from .telegram_api import check_username
+
+    started_at = datetime.now(timezone.utc).isoformat(timespec="microseconds")
+    started = monotonic()
+    result, flood_seconds = "other_error", None
+    try:
+        status, note = await asyncio.wait_for(check_username(client, name), timeout)
+        result = status
+        return status, note
+    except errors.FloodWaitError as exc:
+        result, flood_seconds = "flood_wait", exc.seconds
+        raise
+    except asyncio.TimeoutError:
+        result = "timeout"
+        raise
+    except errors.RPCError:
+        result = "rpc_error"
+        raise
+    except OSError:
+        result = "network_error"
+        raise
+    finally:
+        safe_record(telemetry, "rpc", started_at, (monotonic() - started) * 1000,
+                    phase, result, flood_seconds)
+
+
+async def one_cycle(client, config, store: Store, limit: int, telemetry=None, *, monotonic=time.monotonic) -> float:
+    from telethon import errors
     from .outbox import deliver_due
 
     names, invalid = load_names(config.usernames_path)
@@ -71,11 +101,13 @@ async def one_cycle(client, config, store: Store, limit: int) -> float:
     LOG.info("Проверяем %d имён из %d (только чтение)", len(selected), len(names))
     for i, name in enumerate(selected):
         try:
-            status, note = await asyncio.wait_for(check_username(client, name), config.check_timeout_seconds)
+            status, note = await _check_measured(client, name, config.check_timeout_seconds, "primary", telemetry,
+                                                 monotonic=monotonic)
             if status == "free":
                 # A second result reduces noisy one-off responses; still not a guarantee.
                 await asyncio.sleep(config.confirm_delay_seconds)
-                status, note = await asyncio.wait_for(check_username(client, name), config.check_timeout_seconds)
+                status, note = await _check_measured(client, name, config.check_timeout_seconds,
+                                                     "confirmation", telemetry, monotonic=monotonic)
             previous, changed = store.record(name, status, note,
                                              alert_first_free=config.alert_first_free)
             LOG.info("@%s: %s%s", name, status, f" (было {previous})" if changed else "")
@@ -94,9 +126,10 @@ async def one_cycle(client, config, store: Store, limit: int) -> float:
             LOG.warning("@%s: временная ошибка %s", name, type(exc).__name__)
         # Re-read the watch list immediately before delivery; it may have
         # changed while this cycle was checking another username.
-        await deliver_due(config, store)
+        await deliver_due(config, store, telemetry)
         if i + 1 < len(selected):
             await asyncio.sleep(config.delay_seconds)
+    safe_record(telemetry, "cycle")
     return config.cycle_pause_seconds
 
 
@@ -113,14 +146,14 @@ async def monitor(config, once: bool, limit: int) -> None:
         if not authorized:
             raise RuntimeError("Сессия не авторизована: запустите python -m username_monitor login")
         on_demand = OnDemandTelegramClient(client)
-        with Store(config.db_path) as store:
+        with Store(config.db_path) as store, Telemetry(config.db_path) as telemetry:
             while True:
-                pause = await one_cycle(on_demand, config, store, limit)
-                await deliver_due(config, store)
+                pause = await one_cycle(on_demand, config, store, limit, telemetry)
+                await deliver_due(config, store, telemetry)
                 if once:
                     break
                 LOG.info("Ожидание %.0f секунд до следующего цикла", pause)
-                await wait_with_outbox(config, store, pause)
+                await wait_with_outbox(config, store, pause, telemetry=telemetry)
     finally:
         await client.disconnect()
 
@@ -165,25 +198,30 @@ def show_notifications_status(db_path: Path) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Telegram username monitor (только проверка)")
-    parser.add_argument("command", choices=["login", "check", "run", "status", "notifications-status", "diagnose", "verify-transport"])
+    parser.add_argument("command", choices=["login", "check", "run", "status", "notifications-status", "metrics-status", "diagnose", "verify-transport"])
     parser.add_argument("--limit", type=int, default=None, help="Количество имён за цикл (не более MAX_PER_CYCLE)")
     parser.add_argument("--username", help="Имя для diagnose или verify-transport (не выводится в отчёте)")
     parser.add_argument("--reconnect", action="store_true", help="Принудительный reconnect в verify-transport")
     parser.add_argument("--idle-probe", action="store_true", help="Проверка 25 секунд простоя и периодических RPC на копии сессии")
+    parser.add_argument("--hours", type=int, default=24, help="Период metrics-status в часах (по умолчанию 24)")
+    parser.add_argument("--json", action="store_true", help="JSON-отчёт metrics-status")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     try:
         if args.idle_probe and args.command != "verify-transport":
             parser.error("--idle-probe доступен только для verify-transport")
-        if args.command in ("status", "notifications-status"):
+        if args.command in ("status", "notifications-status", "metrics-status"):
             from dotenv import load_dotenv
             import os
             load_dotenv(override=False)
             db_path = Path(os.getenv("DB_PATH", "data/monitor.sqlite3"))
             if args.command == "status":
                 show_status(db_path)
-            else:
+            elif args.command == "notifications-status":
                 show_notifications_status(db_path)
+            else:
+                from .telemetry import show_report
+                show_report(db_path, args.hours, args.json)
             return 0
         config = load_config()
         if args.command == "verify-transport":
