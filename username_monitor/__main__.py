@@ -103,7 +103,8 @@ async def one_cycle(client, config, store: Store, limit: int, telemetry=None, *,
     selected_manual = store.select(names, limit)
     selected = [(name, False) for name in selected_manual]
     if pool is not None and config.auto_discovery_per_cycle and len(selected) < limit:
-        auto_name = pool.pick(names, config.auto_discovery_daily_limit)
+        auto_name = pool.pick(names, config.auto_discovery_daily_limit,
+                              market=getattr(config, "market_discovery_enabled", False))
         if auto_name is not None:
             selected.append((auto_name, True))
     if not selected:
@@ -223,8 +224,10 @@ def show_notifications_status(db_path: Path) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Telegram username monitor (только проверка)")
-    parser.add_argument("command", choices=["login", "check", "run", "status", "notifications-status", "metrics-status", "candidates", "diagnose", "verify-transport"])
-    parser.add_argument("candidate_action", nargs="?", choices=["generate", "list", "top", "status", "rescore"])
+    parser.add_argument("command", choices=["login", "check", "run", "status", "notifications-status", "metrics-status", "candidates", "market", "diagnose", "verify-transport"])
+    parser.add_argument("candidate_action", nargs="?", choices=["generate", "list", "top", "status", "rescore",
+                                                        "refresh", "compare", "explain", "score"])
+    # The positional action is shared with candidates; validate market actions below.
     parser.add_argument("--limit", type=int, default=None, help="Количество имён за цикл (не более MAX_PER_CYCLE)")
     parser.add_argument("--username", help="Имя для diagnose или verify-transport (не выводится в отчёте)")
     parser.add_argument("--reconnect", action="store_true", help="Принудительный reconnect в verify-transport")
@@ -237,21 +240,69 @@ def main() -> int:
     parser.add_argument("--category", choices=["startup", "short"], help="Фильтр категории candidates list")
     parser.add_argument("--state", choices=["queued", "checking", "checked", "confirmed_free", "discarded", "retry"],
                         help="Фильтр состояния candidates list")
+    parser.add_argument("--as-of", help="UTC cutoff для сравнения, ISO 8601")
+    parser.add_argument("--username-market", help="Имя кандидата для market explain")
+    parser.add_argument("--file", help="Локальный JSON снимок для market refresh (не нужен для сети)")
+    parser.add_argument("--pool", choices=["test", "base"], help="Пул для market compare")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     try:
         if args.idle_probe and args.command != "verify-transport":
             parser.error("--idle-probe доступен только для verify-transport")
-        if args.command == "candidates" and args.candidate_action is None:
+        if args.command == "candidates" and args.candidate_action not in ("generate", "list", "top", "status", "rescore"):
             parser.error("для candidates укажите generate, list, top, status или rescore")
-        if args.command != "candidates" and args.candidate_action is not None:
-            parser.error("действие candidates доступно только для candidates")
-        if args.command in ("status", "notifications-status", "metrics-status", "candidates"):
+        if args.command == "market" and args.candidate_action not in ("generate", "status", "refresh", "compare", "explain", "score"):
+            parser.error("для market укажите generate, status, refresh, compare, explain или score")
+        if args.command not in ("candidates", "market") and args.candidate_action is not None:
+            parser.error("позиционное действие доступно только для candidates и market")
+        if args.command in ("status", "notifications-status", "metrics-status", "candidates", "market"):
             from dotenv import load_dotenv
             import os
             load_dotenv(override=False)
             db_path = Path(os.getenv("DB_PATH", "data/monitor.sqlite3"))
-            if args.command == "candidates":
+            if args.command == "market":
+                import json
+                from contextlib import closing
+                from .market_data import connect, fetch_daily, import_daily, market_status, utc
+                from .market_reporting import compare, explain, score_unchecked
+                if args.candidate_action in ("generate", "refresh", "score"):
+                    with closing(connect(db_path)) as db:
+                        if args.candidate_action == "generate":
+                            from .market_generation import persist_test_pool
+                            rows = persist_test_pool(db, args.count, args.seed)
+                            print(f"Тестовый рыночный пул: {len(rows)}; production queue не изменена")
+                        elif args.candidate_action == "refresh":
+                            try:
+                                if args.file:
+                                    from .market_data import MAX_BYTES
+                                    with open(args.file, "rb") as source:
+                                        raw = source.read(MAX_BYTES + 1)
+                                else:
+                                    raw = fetch_daily()
+                                added = import_daily(db, raw)
+                                print(f"Добавлено рыночных снимков: {added}")
+                            except (OSError, ValueError):
+                                print("Источник недоступен или данные некорректны; используем последний кеш")
+                            print(json.dumps(market_status(db_path), ensure_ascii=False))
+                        else:
+                            print(f"Рыночные оценки непроверенных кандидатов: {score_unchecked(db)}")
+                else:
+                    if args.candidate_action == "status":
+                        report = market_status(db_path)
+                    elif not db_path.exists():
+                        report = {"status": "no_data"}
+                    else:
+                        with closing(connect(db_path, readonly=True)) as db:
+                            if args.candidate_action == "explain":
+                                name = (args.username_market or "").removeprefix("@").lower()
+                                if not USERNAME_PATTERN.fullmatch(name):
+                                    parser.error("market explain требует имя через --username-market")
+                                report = explain(db, name)
+                            else:
+                                report = compare(db, as_of=utc(args.as_of) if args.as_of else None,
+                                                 top=args.top or 20, pool=args.pool or "auto")
+                    print(json.dumps(report, ensure_ascii=False, indent=2))
+            elif args.command == "candidates":
                 from .discovery import CandidatePool, read_pool
                 if args.candidate_action in ("generate", "rescore"):
                     import sqlite3
