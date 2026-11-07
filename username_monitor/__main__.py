@@ -31,6 +31,25 @@ def create_telegram_client(config, *, flood_sleep_threshold=None):
     return TelegramClient(str(config.session_path), config.api_id, config.api_hash, **options)
 
 
+class OnDemandTelegramClient:
+    """Use one session owner, with a connection only while an RPC is active."""
+
+    def __init__(self, client):
+        self.client = client
+        self._lock = asyncio.Lock()
+
+    async def __call__(self, request):
+        # The same SQLite session must never be used by concurrent connections.
+        async with self._lock:
+            try:
+                await self.client.connect()
+                return await self.client(request)
+            finally:
+                # Telethon cancels its receive, update and keepalive tasks here.
+                # asyncio.wait_for in one_cycle also waits for this on timeout.
+                await self.client.disconnect()
+
+
 async def login(config) -> None:
     config.session_path.parent.mkdir(parents=True, exist_ok=True)
     client = create_telegram_client(config)
@@ -94,13 +113,18 @@ async def one_cycle(client, config, store: Store, limit: int) -> float:
 async def monitor(config, once: bool, limit: int) -> None:
     config.session_path.parent.mkdir(parents=True, exist_ok=True)
     client = create_telegram_client(config, flood_sleep_threshold=0)
-    await client.connect()
     try:
-        if not await client.is_user_authorized():
+        try:
+            await asyncio.wait_for(client.connect(), config.check_timeout_seconds)
+            authorized = await asyncio.wait_for(client.is_user_authorized(), config.check_timeout_seconds)
+        finally:
+            await client.disconnect()
+        if not authorized:
             raise RuntimeError("Сессия не авторизована: запустите python -m username_monitor login")
+        on_demand = OnDemandTelegramClient(client)
         with Store(config.db_path) as store:
             while True:
-                pause = await one_cycle(client, config, store, limit)
+                pause = await one_cycle(on_demand, config, store, limit)
                 if once:
                     break
                 LOG.info("Ожидание %.0f секунд до следующего цикла", pause)
@@ -127,9 +151,12 @@ def main() -> int:
     parser.add_argument("--limit", type=int, default=None, help="Количество имён за цикл (не более MAX_PER_CYCLE)")
     parser.add_argument("--username", help="Имя для diagnose или verify-transport (не выводится в отчёте)")
     parser.add_argument("--reconnect", action="store_true", help="Принудительный reconnect в verify-transport")
+    parser.add_argument("--idle-probe", action="store_true", help="Проверка 25 секунд простоя и периодических RPC на копии сессии")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     try:
+        if args.idle_probe and args.command != "verify-transport":
+            parser.error("--idle-probe доступен только для verify-transport")
         if args.command == "status":
             from dotenv import load_dotenv
             import os
@@ -145,7 +172,8 @@ def main() -> int:
             if args.reconnect and not args.username:
                 parser.error("--reconnect требует тестовое имя через --username")
             return asyncio.run(verify_transport(
-                config, create_telegram_client, username=name or None, reconnect=args.reconnect
+                config, create_telegram_client, username=name or None, reconnect=args.reconnect,
+                idle_probe=args.idle_probe,
             ))
         if args.command == "diagnose":
             from .diagnostics import diagnose

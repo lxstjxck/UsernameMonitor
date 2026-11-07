@@ -100,7 +100,16 @@ class TestFakeTlsConfig(unittest.TestCase):
                       new_callable=AsyncMock, return_value=0) as probe:
             self.assertEqual(main(), 0)
         self.assertEqual(probe.await_args.kwargs,
-                         {"username": "testusername12345", "reconnect": True})
+                         {"username": "testusername12345", "reconnect": True, "idle_probe": False})
+
+    def test_verify_cli_passes_idle_probe(self):
+        with patch("sys.argv", ["username_monitor", "verify-transport", "--idle-probe"]), \
+                patch("username_monitor.__main__.load_config", return_value=object()), \
+                patch("username_monitor.transport_probe.verify_transport",
+                      new_callable=AsyncMock, return_value=0) as probe:
+            self.assertEqual(main(), 0)
+        self.assertEqual(probe.await_args.kwargs,
+                         {"username": None, "reconnect": False, "idle_probe": True})
 
 
 class TestAdapter(unittest.TestCase):

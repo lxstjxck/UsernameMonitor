@@ -36,7 +36,7 @@ def backup_session(source: Path, destination: Path) -> None:
 
 
 async def verify_transport(config, create_client, *, username: str | None = None,
-                           reconnect: bool = False) -> int:
+                           reconnect: bool = False, idle_probe: bool = False) -> int:
     """Probe only a copy; optional username result goes to isolated SQLite."""
     previous_logging_level = logging.root.manager.disable
     logging.disable(logging.CRITICAL)
@@ -58,6 +58,26 @@ async def verify_transport(config, create_client, *, username: str | None = None
                 print("get_me: PASS")
                 await asyncio.wait_for(client(functions.help.GetConfigRequest()), 15)
                 print("help.GetConfig: PASS")
+                idle_ok = True
+                if idle_probe:
+                    # Deliberately keep this disposable connection open to
+                    # distinguish a quiet socket from a periodically used one.
+                    await asyncio.sleep(25)
+                    try:
+                        await asyncio.wait_for(client(functions.help.GetConfigRequest()), 15)
+                        print("idle 25s + RPC: PASS")
+                    except Exception as exc:
+                        print(f"idle 25s + RPC: FAIL ({type(exc).__name__})")
+                        idle_ok = False
+                    await asyncio.wait_for(client.disconnect(), 5)
+                    client = create_client(copied_config, flood_sleep_threshold=0)
+                    await asyncio.wait_for(client.connect(), 20)
+                    # Five spaced requests use a fresh connection and the
+                    # same isolated session; never overlap two clients.
+                    for _ in range(5):
+                        await asyncio.sleep(5)
+                        await asyncio.wait_for(client(functions.help.GetConfigRequest()), 15)
+                    print("periodic RPC every 5s: PASS")
                 if username is not None:
                     status, note = await asyncio.wait_for(
                         check_username(client, username), config.check_timeout_seconds
@@ -78,7 +98,7 @@ async def verify_transport(config, create_client, *, username: str | None = None
                         return 1
                     await asyncio.wait_for(client(functions.help.GetConfigRequest()), 15)
                     print("reconnect: PASS")
-                return 0
+                return 0 if idle_ok else 1
             finally:
                 await asyncio.wait_for(client.disconnect(), 5)
     except errors.FloodWaitError as exc:

@@ -58,8 +58,11 @@ rollback. The `verify-transport` command uses an SQLite backup of the
 existing session, never calls `login`, and does not change the original.
 For a full preflight, pass `--username testusername12345 --reconnect`:
 the one username result is stored in temporary SQLite without notifications,
-then a fresh connection requests Telegram config again. The actual systemd
-unit name must be discovered on the VPS before using the rollout instructions.
+then a fresh connection requests Telegram config again. Add `--idle-probe`
+to measure a 25-second idle interval and a separate series of RPCs five
+seconds apart on a copied session, with production stopped. For the running
+`username-monitor.service`, follow [the idle lifecycle update](deploy/idle-lifecycle-update.md).
+Confirm the actual unit name on the VPS before using other rollout instructions.
 
 Для подключения Telethon через MTProxy заполните в `.env` все три параметра:
 
