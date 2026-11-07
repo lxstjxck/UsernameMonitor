@@ -8,7 +8,6 @@ Type=simple
 User=__RUN_USER__
 Group=__RUN_GROUP__
 WorkingDirectory=__PROJECT_DIR__
-EnvironmentFile=-/etc/username-monitor/mtproxy.env
 ExecStart=__PROJECT_DIR__/.venv/bin/python -m username_monitor run
 Restart=on-failure
 RestartSec=30

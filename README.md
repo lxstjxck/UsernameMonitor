@@ -21,8 +21,8 @@ Debian/Ubuntu VPS, Python >= 3.10, `python3-venv`, Git, Telegram-аккаунт,
 sudo apt update
 sudo apt install -y python3 python3-venv git
 # После публикации репозитория на GitHub:
-git clone https://github.com/lxstjxck/TelegramUsernameMonitor.git
-cd TelegramUsernameMonitor
+git clone https://github.com/lxstjxck/UsernameMonitor.git
+cd UsernameMonitor
 python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements.txt
 cp .env.example .env
@@ -41,10 +41,12 @@ nano usernames.txt
 ### MTProxy
 
 For a purchased EE/Base64 FakeTLS MTProxy, set `TG_TRANSPORT=faketls` and
-`TG_MTPROXY_HOST`, `TG_MTPROXY_PORT`, `TG_MTPROXY_SECRET_B64` in a
-root-owned systemd environment file (`/etc/username-monitor/mtproxy.env`,
-mode 0600). The last variable is read only from the process environment
-before the project `.env` is loaded; never write it to the project or Git.
+`TG_MTPROXY_HOST`, `TG_MTPROXY_PORT`, `TG_MTPROXY_SECRET_B64` in the
+process environment. On systemd, use the private `LoadCredential=` file
+and [credential runner](deploy/run-with-mtproxy-credential.py): it injects
+the secret into the application environment without placing its value in
+unit settings or command arguments. The last variable is read before the
+project `.env` is loaded; never write it to the project or Git.
 The FakeTLS TCP endpoint may differ from the Telegram DC address. The
 adapter keeps Telethon's DC ID and connects TCP to the MTProxy without SOCKS5.
 Set `TG_TRANSPORT=legacy` to restore the original `TG_PROXY_*` route (or
@@ -54,6 +56,10 @@ direct TCP. The default is `legacy`. See
 install, session backup, authenticated read-only RPC smoke, deployment and
 rollback. The `verify-transport` command uses an SQLite backup of the
 existing session, never calls `login`, and does not change the original.
+For a full preflight, pass `--username testusername12345 --reconnect`:
+the one username result is stored in temporary SQLite without notifications,
+then a fresh connection requests Telegram config again. The actual systemd
+unit name must be discovered on the VPS before using the rollout instructions.
 
 Для подключения Telethon через MTProxy заполните в `.env` все три параметра:
 
@@ -95,7 +101,7 @@ sudo systemctl status telegram-username-monitor
 sudo journalctl -u telegram-username-monitor -f
 ```
 
-Скрипт явно проверяет `.env`, виртуальное окружение, сессию и существование пользователя. Он включает сервис на автозапуск. Для остановки:
+Скрипт предназначен для первичной установки: он создаёт unit `telegram-username-monitor.service` и сразу запускает его. Для перехода уже работающего сервиса на FakeTLS не запускайте этот скрипт; сначала определите фактическое имя unit и следуйте [плану развёртывания](deploy/faketls-rollout.md). Для остановки установленного таким способом unit:
 
 ```bash
 sudo systemctl stop telegram-username-monitor

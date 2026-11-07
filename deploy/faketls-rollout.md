@@ -1,126 +1,177 @@
-# FakeTLS rollout for /opt/username-monitor
+# FakeTLS rollout on the Moscow VPS
 
-These commands are for a later, explicitly approved deployment. Do not run
-`login`, `check`, `run`, or the existing `diagnose` during the preflight:
-`verify-transport` is the read-only two-RPC probe on a disposable SQLite copy.
-The existing /opt/username-monitor/data/telegram.session is never moved,
-deleted, or opened writable by the probe.
+The production switch below requires separate approval after preflight.
+Do not run `login`, `deploy/install-systemd.sh`, or another monitor process.
+Keep the old checkout and virtual environment for rollback. Never edit
+`/opt/username-monitor/data/telegram.session`.
 
-## Prepare an isolated candidate
+## 1. Discover the actual service
 
-After the reviewed change has been pushed, on the VPS:
+Do not assume the name from the repository template. On the VPS:
 
 ```bash
-RUN_USER="$(systemctl show -P User telegram-username-monitor.service)"
-test -n "$RUN_USER"
-sudo install -d -m 700 -o "$RUN_USER" -g "$(id -gn "$RUN_USER")" /opt/username-monitor-candidate
-sudo -u "$RUN_USER" git clone https://github.com/lxstjxck/UsernameMonitor.git /opt/username-monitor-candidate
-cd /opt/username-monitor-candidate
-sudo -u "$RUN_USER" python3 -m venv .venv
-sudo -u "$RUN_USER" .venv/bin/python -m pip install -r requirements.txt
-sudo install -m 600 -o "$RUN_USER" -g "$(id -gn "$RUN_USER")" /opt/username-monitor/.env .env
+systemctl list-units --all --type=service 'username-monitor.service' 'telegram-username-monitor.service' --no-pager
+systemctl list-unit-files 'username-monitor.service' 'telegram-username-monitor.service' --no-pager
+read -r -p "Active unit name from the output: " SERVICE
+case "$SERVICE" in
+  username-monitor.service|telegram-username-monitor.service) ;;
+  *) echo "Unknown unit; stop rollout" >&2; exit 1 ;;
+esac
+systemctl is-active --quiet "$SERVICE"
+RUN_USER="$(systemctl show -P User "$SERVICE")"
+test -n "$RUN_USER" && test "$RUN_USER" != root
+systemctl show -P WorkingDirectory "$SERVICE"
+systemctl show -P FragmentPath "$SERVICE"
+```
+
+If neither or both candidates are active, investigate before proceeding.
+Inspect the unit privately for its executable, working directory and existing
+drop-ins. Do not share raw unit contents: they may contain credentials.
+
+## 2. Prepare an isolated candidate
+
+Only after the reviewed commit is published, insert its full SHA. This does
+not change files used by the running service.
+
+```bash
+REVIEWED_SHA='<reviewed-commit-sha>'
+CANDIDATE=/opt/username-monitor-candidate
+sudo install -d -m 700 -o "$RUN_USER" -g "$(id -gn "$RUN_USER")" "$CANDIDATE"
+sudo -u "$RUN_USER" git clone https://github.com/lxstjxck/UsernameMonitor.git "$CANDIDATE"
+test "$(sudo -u "$RUN_USER" git -C "$CANDIDATE" rev-parse HEAD)" = "$REVIEWED_SHA"
+sudo -u "$RUN_USER" python3 -m venv "$CANDIDATE/.venv"
+sudo -u "$RUN_USER" "$CANDIDATE/.venv/bin/python" -m pip install -r "$CANDIDATE/requirements.txt"
+sudo -u "$RUN_USER" "$CANDIDATE/.venv/bin/python" -m pip check
+test -f /opt/username-monitor/data/telegram.session
+test -f /opt/username-monitor/data/monitor.sqlite3
+test -f /opt/username-monitor/usernames.txt
+sudo install -m 600 -o "$RUN_USER" -g "$(id -gn "$RUN_USER")" /opt/username-monitor/.env "$CANDIDATE/.env"
+cd "$CANDIDATE"
 sudo -u "$RUN_USER" .venv/bin/python -m unittest discover -s tests -v
 ```
 
-The service account needs read access to the existing project and session.
-Do not change ownership of the production session.
-
-Create the private systemd environment file on the VPS. Edit locally on the
-VPS; do not paste the secret into shell arguments, chat, logs, or Git.
-`TG_MTPROXY_SECRET_B64` must be the purchased EE/Base64 value. The program
-requires exactly 22 decoded bytes (EE + 16-byte key + five ASCII SNI bytes).
+If the current unit uses other configuration paths or the database test fails,
+adapt the absolute paths in the switch step before continuing. Keep all
+credentials private. Create a root-owned credential file containing **only**
+the Base64 secret. Check `systemctl --version`: `LoadCredential=` requires
+systemd 247 or newer. Stop the rollout if unavailable. Never put the value
+in a command, Git, chat, or the project's `.env`.
 
 ```bash
 sudo install -d -m 700 /etc/username-monitor
-sudo install -m 600 /dev/null /etc/username-monitor/mtproxy.env
-sudoedit /etc/username-monitor/mtproxy.env
-# Set these four lines in the editor, without quoting or exporting them:
-# TG_TRANSPORT=faketls
-# TG_MTPROXY_HOST=45.130.124.28
-# TG_MTPROXY_PORT=443
-# TG_MTPROXY_SECRET_B64=<private value>
-sudo chmod 600 /etc/username-monitor/mtproxy.env
+sudo install -m 600 /dev/null /etc/username-monitor/mtproxy-secret.b64
+sudoedit /etc/username-monitor/mtproxy-secret.b64
+# In the editor: the Base64 value alone, no variable name or quotes.
+sudo chmod 600 /etc/username-monitor/mtproxy-secret.b64
 ```
 
-Keep the secret out of the project's `.env`. The service and the isolated
-probe read it from the protected process environment.
+The decoded secret must be 22 bytes, beginning with EE. systemd supplies
+it as a private credential; the runner puts it into `TG_MTPROXY_SECRET_B64`
+in the application process. The app reads that variable before `.env`.
+Preserve the old transport settings until production smoke succeeds.
 
-## Back up the live session and verify through a disposable copy
+## 3. Back up and probe the authorized session
 
-The SQLite online backup is safe while the old service is running. The backup
-destination must not already exist. Set a private destination name, then run:
+The SQLite online backup includes WAL, reads the source in read-only mode,
+and creates a private destination exclusively. Leave the old service running.
 
 ```bash
-cd /opt/username-monitor-candidate
 BACKUP="/opt/username-monitor/data/telegram-before-faketls-$(date +%Y%m%d-%H%M%S).session"
+cd "$CANDIDATE"
 sudo -u "$RUN_USER" .venv/bin/python -c 'import sys; from pathlib import Path; from username_monitor.transport_probe import backup_session; backup_session(Path("/opt/username-monitor/data/telegram.session"), Path(sys.argv[1]))' "$BACKUP"
-sudo -u "$RUN_USER" .venv/bin/python -c 'import sys, sqlite3; db=sqlite3.connect("file:" + sys.argv[1] + "?mode=ro", uri=True); assert db.execute("PRAGMA integrity_check").fetchone()[0] == "ok"; db.close()' "$BACKUP"
+sudo -u "$RUN_USER" .venv/bin/python -c 'import sys, sqlite3; from pathlib import Path; db=sqlite3.connect(Path(sys.argv[1]).resolve().as_uri()+"?mode=ro",uri=True); assert db.execute("PRAGMA integrity_check").fetchone()[0]=="ok"; db.close()' "$BACKUP"
 ```
 
-The service must remain active and unchanged at this point. Run the candidate
-probe via systemd so the service user receives the protected environment.
-Override SESSION_PATH to the persistent backup. The probe creates another
-private SQLite copy, runs authenticated `get_me` and `help.GetConfig` on it,
-then deletes that temporary copy. It does not call `start()` or attempt login.
+The probe makes another disposable SQLite copy of the backup. It runs
+authorized `get_me`, `help.GetConfigRequest`, one
+`account.CheckUsernameRequest`, records the result in isolated SQLite, then
+forces a fresh FakeTLS connection and requests Telegram config again. It
+never calls `start()`, writes the production monitor DB or sends alerts.
+Choose a valid test name outside `usernames.txt`; its value is not printed.
+
+```bash
+TEST_USERNAME=testusername12345
+sudo systemd-run --wait --pipe --collect \
+  -p "User=$RUN_USER" -p "WorkingDirectory=$CANDIDATE" \
+  -p LoadCredential=mtproxy_secret_b64:/etc/username-monitor/mtproxy-secret.b64 \
+  "$CANDIDATE/.venv/bin/python" "$CANDIDATE/deploy/run-with-mtproxy-credential.py" \
+  --mtproxy-host 45.130.124.28 --mtproxy-port 443 --session-path "$BACKUP" verify-transport \
+  --username "$TEST_USERNAME" --reconnect
+```
+
+Require exit code 0 and: `get_me: PASS`, `help.GetConfig: PASS`,
+`account.checkUsername: PASS (...)`, `isolated SQLite: PASS`,
+`reconnect: PASS`. Any `FLOOD_WAIT`, timeout or authorization failure blocks
+deployment. Unit tests inject FloodWait, network failure and timeout; do not
+deliberately trigger Telegram rate limits. The raw AuthKey/Ping 60/60 test
+does not replace this authorized Telethon probe.
+
+For notification delivery, send one neutral, clearly labeled test message
+through the already configured Bot API or Cloudflare `/bot/sendMessage`.
+This does not claim that any username is free and contains no secret in the
+command line:
 
 ```bash
 sudo systemd-run --wait --pipe --collect \
-  -p "User=$RUN_USER" \
-  -p "WorkingDirectory=/opt/username-monitor-candidate" \
-  -p "EnvironmentFile=/etc/username-monitor/mtproxy.env" \
-  -p "Environment=SESSION_PATH=$BACKUP" \
-  /opt/username-monitor-candidate/.venv/bin/python -m username_monitor verify-transport
+  -p "User=$RUN_USER" -p "WorkingDirectory=$CANDIDATE" \
+  "$CANDIDATE/.venv/bin/python" -c 'import asyncio,sys; from username_monitor.config import load_config; from username_monitor.notify import notify; c=load_config(); ok=asyncio.run(notify(c.bot_token,c.chat_id,"UsernameMonitor: тест доставки уведомлений, без проверки username",bot_proxy_url=c.bot_proxy_url,bot_proxy_secret=c.bot_proxy_secret)); sys.exit(0 if ok else 1)'
 ```
 
-Expected output: `get_me: PASS`, `help.GetConfig: PASS`, exit code 0.
-Any failure blocks the service switch. Do not use `login` to repair the
-backup. The separate raw AuthKey/PingRequest test does not replace this
-authorized Telethon RPC probe.
+Require exit code 0 and receipt of the neutral message. Present these
+preflight results and the rollback plan before the production switch.
 
-## Switch production only after both gates pass
+## 4. Switch production, only after explicit approval
 
-Prepare a separate virtual environment under the production project, then
-stop only `telegram-username-monitor.service`. Preserve the old environment.
-Use the reviewed commit SHA in place of `<reviewed-sha>`.
+Do not move the candidate virtual environment; Python venv paths are not
+generally relocatable. Stop the **actual** unit first. A drop-in changes its
+executable and working directory while leaving the old checkout and venv
+intact. Absolute paths preserve the existing session, monitor SQLite and
+watched names. Check for conflicting drop-ins before writing this one.
 
 ```bash
-cd /opt/username-monitor
-git fetch origin main
-git rev-parse HEAD > /tmp/username-monitor-previous-sha
-git checkout --detach <reviewed-sha>
-sudo -u "$RUN_USER" python3 -m venv .venv-faketls
-sudo -u "$RUN_USER" .venv-faketls/bin/python -m pip install -r requirements.txt
-sudo systemctl stop telegram-username-monitor.service
-mv .venv .venv-before-faketls
-mv .venv-faketls .venv
-sudo install -d /etc/systemd/system/telegram-username-monitor.service.d
-printf '[Service]\nEnvironmentFile=/etc/username-monitor/mtproxy.env\n' | sudo tee /etc/systemd/system/telegram-username-monitor.service.d/faketls.conf >/dev/null
+sudo systemctl stop "$SERVICE"
+sudo install -d -m 755 "/etc/systemd/system/$SERVICE.d"
+sudo tee "/etc/systemd/system/$SERVICE.d/faketls-rollout.conf" >/dev/null <<EOF
+[Service]
+WorkingDirectory=$CANDIDATE
+LoadCredential=mtproxy_secret_b64:/etc/username-monitor/mtproxy-secret.b64
+ExecStart=
+ExecStart=$CANDIDATE/.venv/bin/python $CANDIDATE/deploy/run-with-mtproxy-credential.py --mtproxy-host 45.130.124.28 --mtproxy-port 443 --session-path /opt/username-monitor/data/telegram --db-path /opt/username-monitor/data/monitor.sqlite3 --usernames-path /opt/username-monitor/usernames.txt run
+EOF
 sudo systemctl daemon-reload
-sudo systemctl start telegram-username-monitor.service
-sudo systemctl --no-pager status telegram-username-monitor.service
-sudo journalctl -u telegram-username-monitor.service -n 50 --no-pager
+sudo systemctl start "$SERVICE"
+sudo systemctl is-active --quiet "$SERVICE"
 ```
 
-Smoke: confirm the service stays active through a monitoring cycle, the
-existing session remains authorized, and no connection errors appear. Check
-`status` to inspect stored results. Do not run an extra `check` concurrently
-with the service and do not test notifications by sending a message.
-
-## One-setting transport rollback
-
-Change only `TG_TRANSPORT=faketls` to `TG_TRANSPORT=legacy` in the protected
-environment file, then restart the monitor service. `legacy` selects the
-previous `TG_PROXY_*` MTProxy when configured in the project's `.env`,
-otherwise direct TCP. The FakeTLS host and secret can remain in the protected
-environment and are ignored in legacy mode. Verify service status and logs.
+Smoke: verify the service stays active through a monitoring cycle; check
+authorization, absence of connection errors and advancement of SQLite
+history. Do not run `check` alongside the service or send a fake free alert.
 
 ```bash
-sudoedit /etc/username-monitor/mtproxy.env
-sudo systemctl restart telegram-username-monitor.service
-sudo systemctl --no-pager status telegram-username-monitor.service
+cd "$CANDIDATE"
+sudo -u "$RUN_USER" env DB_PATH=/opt/username-monitor/data/monitor.sqlite3 \
+  .venv/bin/python -m username_monitor status
+sudo systemctl is-active "$SERVICE"
 ```
 
-Do not touch `flowseal.service`, Cloudflare Worker routes, or notification
-settings. If a full code rollback is necessary, stop the monitor, restore the
-recorded commit and `.venv-before-faketls`, then restart it; leave
-`data/telegram.session` and `.env` untouched.
+Review the journal privately for connection failures and secret leakage.
+Do not paste unredacted logs or unit configuration into issues or chat.
+
+## 5. Rollback
+
+If the candidate fails, restore the untouched old executable and venv by
+removing only the rollout drop-in. Do not automatically select a known broken
+transport; do not restore the original session from backup without a separate
+recovery decision.
+
+```bash
+sudo systemctl stop "$SERVICE"
+sudo rm "/etc/systemd/system/$SERVICE.d/faketls-rollout.conf"
+sudo systemctl daemon-reload
+sudo systemctl start "$SERVICE"
+sudo systemctl is-active --quiet "$SERVICE"
+```
+
+Keep the persistent backup private. Legacy MTProxy code can be removed in
+another commit only after stable production smoke and separate confirmation.
+Cloudflare notifications and `flowseal.service` are outside that cleanup.

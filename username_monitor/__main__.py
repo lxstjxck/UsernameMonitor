@@ -125,7 +125,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Telegram username monitor (только проверка)")
     parser.add_argument("command", choices=["login", "check", "run", "status", "diagnose", "verify-transport"])
     parser.add_argument("--limit", type=int, default=None, help="Количество имён за цикл (не более MAX_PER_CYCLE)")
-    parser.add_argument("--username", help="Имя для команды diagnose (не выводится в отчёте)")
+    parser.add_argument("--username", help="Имя для diagnose или verify-transport (не выводится в отчёте)")
+    parser.add_argument("--reconnect", action="store_true", help="Принудительный reconnect в verify-transport")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     try:
@@ -138,7 +139,14 @@ def main() -> int:
         config = load_config()
         if args.command == "verify-transport":
             from .transport_probe import verify_transport
-            return asyncio.run(verify_transport(config, create_telegram_client))
+            name = (args.username or "").removeprefix("@").lower()
+            if args.username and not USERNAME_PATTERN.fullmatch(name):
+                parser.error("для verify-transport укажите корректное имя через --username")
+            if args.reconnect and not args.username:
+                parser.error("--reconnect требует тестовое имя через --username")
+            return asyncio.run(verify_transport(
+                config, create_telegram_client, username=name or None, reconnect=args.reconnect
+            ))
         if args.command == "diagnose":
             from .diagnostics import diagnose
 

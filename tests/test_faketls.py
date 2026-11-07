@@ -10,12 +10,13 @@ import sqlite3
 import tempfile
 import unittest
 from contextlib import redirect_stdout
+from contextlib import redirect_stderr
 from unittest.mock import AsyncMock, Mock, patch
 
-from telethon import functions
+from telethon import errors, functions
 from tgnet.connection.faketls import TgNetConnectionTls
 
-from username_monitor.__main__ import create_telegram_client
+from username_monitor.__main__ import create_telegram_client, main
 from username_monitor.config import load_config
 from username_monitor.transport_probe import backup_session, verify_transport
 
@@ -81,6 +82,25 @@ class TestFakeTlsConfig(unittest.TestCase):
                 patch("username_monitor.config.load_dotenv", side_effect=project_dotenv):
             with self.assertRaisesRegex(ValueError, "TG_MTPROXY_SECRET_B64"):
                 load_config()
+
+    def test_verify_cli_validates_name_without_echoing_it(self):
+        with patch("sys.argv", ["username_monitor", "verify-transport",
+                                "--username", "private-invalid-name", "--reconnect"]), \
+                patch("username_monitor.__main__.load_config", return_value=object()), \
+                redirect_stderr(io.StringIO()) as stderr:
+            with self.assertRaises(SystemExit):
+                main()
+        self.assertNotIn("private-invalid-name", stderr.getvalue())
+
+    def test_verify_cli_passes_valid_name_and_reconnect(self):
+        with patch("sys.argv", ["username_monitor", "verify-transport",
+                                "--username", "@TestUsername12345", "--reconnect"]), \
+                patch("username_monitor.__main__.load_config", return_value=object()), \
+                patch("username_monitor.transport_probe.verify_transport",
+                      new_callable=AsyncMock, return_value=0) as probe:
+            self.assertEqual(main(), 0)
+        self.assertEqual(probe.await_args.kwargs,
+                         {"username": "testusername12345", "reconnect": True})
 
 
 class TestAdapter(unittest.TestCase):
@@ -177,6 +197,79 @@ class TestSessionProbe(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(hashlib.sha256(self.original.read_bytes()).digest(), original_hash)
         client.disconnect.assert_awaited_once()
         self.assertEqual(list(Path(self.tmp.name).glob("*")), [self.original])
+
+    async def test_username_sqlite_and_forced_reconnect_use_only_copy(self):
+        original_hash = hashlib.sha256(self.original.read_bytes()).digest()
+        clients = []
+        def make_client():
+            client = Mock(connect=AsyncMock(), is_user_authorized=AsyncMock(return_value=True),
+                          get_me=AsyncMock(return_value=object()), disconnect=AsyncMock())
+            async def rpc(request):
+                if isinstance(request, functions.account.CheckUsernameRequest):
+                    return False  # occupied/unavailable; never a free alert
+                self.assertIsInstance(request, functions.help.GetConfigRequest)
+                return object()
+            client.side_effect = rpc
+            clients.append(client)
+            return client
+        def create(copied_config, **kwargs):
+            self.assertNotEqual(copied_config.session_path, self.original)
+            self.assertEqual(kwargs["flood_sleep_threshold"], 0)
+            return make_client()
+        output = io.StringIO()
+        with redirect_stdout(output), patch("username_monitor.notify.notify") as notify:
+            code = await verify_transport(self.cfg, create, username="testusername12345", reconnect=True)
+        self.assertEqual(code, 0)
+        self.assertIn("account.checkUsername: PASS (unavailable)", output.getvalue())
+        self.assertIn("isolated SQLite: PASS", output.getvalue())
+        self.assertIn("reconnect: PASS", output.getvalue())
+        self.assertEqual(len(clients), 2)
+        for client in clients:
+            client.connect.assert_awaited_once()
+            client.disconnect.assert_awaited_once()
+        notify.assert_not_called()
+        self.assertFalse(self.cfg.db_path.exists())
+        self.assertEqual(hashlib.sha256(self.original.read_bytes()).digest(), original_hash)
+
+    async def test_flood_wait_stops_probe_without_notification(self):
+        client = Mock(connect=AsyncMock(), is_user_authorized=AsyncMock(return_value=True),
+                      get_me=AsyncMock(return_value=object()), disconnect=AsyncMock())
+        async def rpc(request):
+            if isinstance(request, functions.account.CheckUsernameRequest):
+                raise errors.FloodWaitError(request=None, capture=45)
+            return object()
+        client.side_effect = rpc
+        output = io.StringIO()
+        with redirect_stdout(output), patch("username_monitor.notify.notify") as notify:
+            code = await verify_transport(self.cfg, lambda *a, **k: client,
+                                          username="testusername12345", reconnect=True)
+        self.assertEqual(code, 1)
+        self.assertIn("FLOOD_WAIT (45 с)", output.getvalue())
+        client.disconnect.assert_awaited_once()
+        notify.assert_not_called()
+
+    async def test_username_timeout_cancels_and_redacts(self):
+        cancelled = asyncio.Event()
+        client = Mock(connect=AsyncMock(), is_user_authorized=AsyncMock(return_value=True),
+                      get_me=AsyncMock(return_value=object()), disconnect=AsyncMock())
+        async def rpc(request):
+            if isinstance(request, functions.account.CheckUsernameRequest):
+                try:
+                    await asyncio.sleep(10)
+                finally:
+                    cancelled.set()
+            return object()
+        client.side_effect = rpc
+        output = io.StringIO()
+        with redirect_stdout(output), patch("username_monitor.notify.notify") as notify:
+            code = await verify_transport(replace(self.cfg, check_timeout_seconds=0.01),
+                                          lambda *a, **k: client,
+                                          username="testusername12345", reconnect=True)
+        self.assertEqual(code, 1)
+        self.assertTrue(cancelled.is_set())
+        self.assertIn("FAIL (TimeoutError)", output.getvalue())
+        client.disconnect.assert_awaited_once()
+        notify.assert_not_called()
 
     async def test_unauthorized_and_connection_failure_are_safe(self):
         for authorized, error in ((False, None), (True, OSError(SECRET_B64))):
