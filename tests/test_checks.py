@@ -58,6 +58,7 @@ class TestCheckCycle(unittest.IsolatedAsyncioTestCase):
             bot_proxy_secret=None,
             alert_first_free=True,
         )
+        self.config.usernames_path.write_text(NAME + "\n")
         self.names_patch = patch("username_monitor.__main__.load_names", return_value=([NAME], []))
         self.names_patch.start()
         self.addCleanup(self.names_patch.stop)
@@ -95,6 +96,7 @@ class TestCheckCycle(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(calls, 2)
         self.assertEqual(self.store.summary()[0][1], "unknown")
         self.assertEqual(self.store.summary()[0][3], "TimeoutError")
+        self.assertEqual(self.store.db.execute("SELECT COUNT(*) FROM notification_outbox").fetchone()[0], 0)
         notify.assert_not_awaited()
 
     async def test_two_successful_free_checks_can_notify(self):
@@ -104,6 +106,11 @@ class TestCheckCycle(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(client.await_count, 2)
         self.assertEqual(self.store.summary()[0][1], "free")
         notify.assert_awaited_once()
+        with patch("username_monitor.notify.notify", new_callable=AsyncMock) as second_notify:
+            await one_cycle(client, self.config, self.store, 1)
+            second_notify.assert_not_awaited()
+        self.assertEqual(self.store.db.execute("SELECT status,COUNT(*) FROM notification_outbox").fetchone(),
+                         ("delivered", 1))
 
     async def test_failed_delivery_is_not_logged_as_success(self):
         client = AsyncMock(return_value=True)
@@ -121,6 +128,7 @@ class TestCheckCycle(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(pause, 760)
         self.assertEqual(self.store.summary()[0][1], "unknown")
         self.assertEqual(self.store.summary()[0][3], "FloodWait")
+        self.assertEqual(self.store.db.execute("SELECT COUNT(*) FROM notification_outbox").fetchone()[0], 0)
         notify.assert_not_awaited()
 
     async def test_unknown_rpc_error_is_temporary(self):

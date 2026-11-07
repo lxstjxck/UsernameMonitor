@@ -58,11 +58,12 @@ async def login(config) -> None:
 async def one_cycle(client, config, store: Store, limit: int) -> float:
     from telethon import errors
     from .telegram_api import check_username
-    from .notify import notify
+    from .outbox import deliver_due
 
     names, invalid = load_names(config.usernames_path)
     if invalid:
         LOG.warning("Пропущено некорректных имён: %d (%s)", len(invalid), ", ".join(invalid[:3]))
+    store.cancel_unwatched(names)
     selected = store.select(names, limit)
     if not selected:
         LOG.warning("Список имён пуст; проверять нечего")
@@ -75,17 +76,9 @@ async def one_cycle(client, config, store: Store, limit: int) -> float:
                 # A second result reduces noisy one-off responses; still not a guarantee.
                 await asyncio.sleep(config.confirm_delay_seconds)
                 status, note = await asyncio.wait_for(check_username(client, name), config.check_timeout_seconds)
-            previous, changed = store.record(name, status, note)
+            previous, changed = store.record(name, status, note,
+                                             alert_first_free=config.alert_first_free)
             LOG.info("@%s: %s%s", name, status, f" (было {previous})" if changed else "")
-            if status == "free" and changed and (previous is not None or config.alert_first_free):
-                delivered = await notify(config.bot_token, config.chat_id,
-                                         f"🟢 Возможный свободный username: @{name}\n"
-                                         f"До этого: {previous or 'не проверялся'}\n"
-                                         "Проверь и назначь вручную в Telegram. Доступность не гарантирована.",
-                                         bot_proxy_url=config.bot_proxy_url,
-                                         bot_proxy_secret=config.bot_proxy_secret)
-                if not delivered:
-                    LOG.warning("@%s: уведомление не доставлено", name)
         except errors.FloodWaitError as exc:
             cooldown = max(config.cycle_pause_seconds, float(exc.seconds) + 60)
             store.mark_error(name, "FloodWait")
@@ -99,12 +92,16 @@ async def one_cycle(client, config, store: Store, limit: int) -> float:
             # Do not include raw exception messages (they may contain data).
             store.mark_error(name, type(exc).__name__)
             LOG.warning("@%s: временная ошибка %s", name, type(exc).__name__)
+        # Re-read the watch list immediately before delivery; it may have
+        # changed while this cycle was checking another username.
+        await deliver_due(config, store)
         if i + 1 < len(selected):
             await asyncio.sleep(config.delay_seconds)
     return config.cycle_pause_seconds
 
 
 async def monitor(config, once: bool, limit: int) -> None:
+    from .outbox import deliver_due, wait_with_outbox
     config.session_path.parent.mkdir(parents=True, exist_ok=True)
     client = create_telegram_client(config, flood_sleep_threshold=0)
     try:
@@ -119,10 +116,11 @@ async def monitor(config, once: bool, limit: int) -> None:
         with Store(config.db_path) as store:
             while True:
                 pause = await one_cycle(on_demand, config, store, limit)
+                await deliver_due(config, store)
                 if once:
                     break
                 LOG.info("Ожидание %.0f секунд до следующего цикла", pause)
-                await asyncio.sleep(pause)
+                await wait_with_outbox(config, store, pause)
     finally:
         await client.disconnect()
 
@@ -139,9 +137,35 @@ def show_status(db_path: Path) -> None:
         print("Проверок ещё не было")
 
 
+def show_notifications_status(db_path: Path) -> None:
+    import sqlite3
+    if not db_path.exists():
+        print("Очередь уведомлений: база ещё не создана")
+        return
+    db = sqlite3.connect(db_path.resolve().as_uri() + "?mode=ro", uri=True)
+    try:
+        if not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='notification_outbox'").fetchone():
+            print("Очередь уведомлений: таблица ещё не создана")
+            return
+        counts = dict(db.execute("SELECT status,COUNT(*) FROM notification_outbox GROUP BY status"))
+        for status in ("pending", "delivered", "cancelled"):
+            print(f"{status}: {counts.get(status, 0)}")
+        next_at = db.execute("SELECT MIN(next_attempt_at) FROM notification_outbox WHERE status='pending'").fetchone()[0]
+        print(f"next_attempt_at: {next_at or '-'}")
+        for code, count in db.execute("""
+            SELECT last_error_code,COUNT(*) FROM notification_outbox
+            WHERE status='pending' AND last_error_code IS NOT NULL GROUP BY last_error_code
+        """):
+            # Only fixed safe categories written by this application are shown.
+            if code == "delivery_failed":
+                print(f"delivery_failed: {count}")
+    finally:
+        db.close()
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Telegram username monitor (только проверка)")
-    parser.add_argument("command", choices=["login", "check", "run", "status", "diagnose", "verify-transport"])
+    parser.add_argument("command", choices=["login", "check", "run", "status", "notifications-status", "diagnose", "verify-transport"])
     parser.add_argument("--limit", type=int, default=None, help="Количество имён за цикл (не более MAX_PER_CYCLE)")
     parser.add_argument("--username", help="Имя для diagnose или verify-transport (не выводится в отчёте)")
     parser.add_argument("--reconnect", action="store_true", help="Принудительный reconnect в verify-transport")
@@ -151,11 +175,15 @@ def main() -> int:
     try:
         if args.idle_probe and args.command != "verify-transport":
             parser.error("--idle-probe доступен только для verify-transport")
-        if args.command == "status":
+        if args.command in ("status", "notifications-status"):
             from dotenv import load_dotenv
             import os
             load_dotenv(override=False)
-            show_status(Path(os.getenv("DB_PATH", "data/monitor.sqlite3")))
+            db_path = Path(os.getenv("DB_PATH", "data/monitor.sqlite3"))
+            if args.command == "status":
+                show_status(db_path)
+            else:
+                show_notifications_status(db_path)
             return 0
         config = load_config()
         if args.command == "verify-transport":

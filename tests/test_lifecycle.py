@@ -65,6 +65,7 @@ class TestOnDemandLifecycle(unittest.IsolatedAsyncioTestCase):
             chat_id="", bot_proxy_url=None, bot_proxy_secret=None,
             alert_first_free=False,
         )
+        self.config.usernames_path.write_text("first123\n")
 
     async def test_rpc_25_seconds_idle_then_rpc_with_no_idle_connection(self):
         client = SessionClient([False, False])
@@ -219,14 +220,14 @@ class TestOnDemandLifecycle(unittest.IsolatedAsyncioTestCase):
         client = SessionClient()
         pauses = []
 
-        async def stop_after_pause(seconds):
+        async def stop_after_pause(_config, _store, seconds):
             pauses.append(seconds)
             self.assertFalse(client.active)
             raise asyncio.CancelledError()
 
         with patch("username_monitor.__main__.create_telegram_client", return_value=client), \
                 patch("username_monitor.__main__.one_cycle", new_callable=AsyncMock, return_value=600) as cycle, \
-                patch("username_monitor.__main__.asyncio.sleep", side_effect=stop_after_pause):
+                patch("username_monitor.outbox.wait_with_outbox", side_effect=stop_after_pause):
             with self.assertRaises(asyncio.CancelledError):
                 await monitor(self.config, once=False, limit=3)
         self.assertEqual(pauses, [600])
