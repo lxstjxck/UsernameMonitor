@@ -30,6 +30,10 @@ class Config:
     mtproxy_secret: bytes = field(repr=False)
     bot_proxy_url: str | None = None
     bot_proxy_secret: str | None = field(default=None, repr=False)
+    auto_discovery_enabled: bool = False
+    auto_discovery_per_cycle: int = 1
+    auto_discovery_daily_limit: int = 12
+    auto_discovery_pool_size: int = 300
 
 
 def _float_env(key: str, default: float, min_value: float) -> float:
@@ -37,6 +41,13 @@ def _float_env(key: str, default: float, min_value: float) -> float:
     if not min_value <= value <= 86400:
         raise ValueError(f"{key} должен быть в диапазоне {min_value}–86400")
     return value
+
+
+def _int_env(key: str, default: int, minimum: int, maximum: int) -> int:
+    raw = os.getenv(key, str(default))
+    if not raw.isdecimal() or not minimum <= int(raw) <= maximum:
+        raise ValueError(f"{key} должен быть целым числом от {minimum} до {maximum}")
+    return int(raw)
 
 
 def load_config() -> Config:
@@ -114,4 +125,8 @@ def load_config() -> Config:
         mtproxy_host=mtproxy_host,
         mtproxy_port=mtproxy_port,
         mtproxy_secret=mtproxy_secret,
+        auto_discovery_enabled=os.getenv("AUTO_DISCOVERY_ENABLED", "false").lower() in ("1", "true", "yes"),
+        auto_discovery_per_cycle=_int_env("AUTO_DISCOVERY_PER_CYCLE", 1, 0, 1),
+        auto_discovery_daily_limit=_int_env("AUTO_DISCOVERY_DAILY_LIMIT", 12, 1, 12),
+        auto_discovery_pool_size=_int_env("AUTO_DISCOVERY_POOL_SIZE", 300, 1, 1000),
     )

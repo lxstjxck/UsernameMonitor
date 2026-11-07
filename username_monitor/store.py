@@ -19,6 +19,7 @@ class OutboxEvent:
     username: str
     previous_status: str | None
     attempts: int
+    source: str = "manual"
 
 
 class Store:
@@ -57,6 +58,9 @@ class Store:
             CREATE INDEX IF NOT EXISTS idx_outbox_due
                 ON notification_outbox(status,next_attempt_at,id);
         """)
+        # Additive migration: old events retain the original manual format.
+        if "source" not in {row[1] for row in self.db.execute("PRAGMA table_info(notification_outbox)")}:
+            self.db.execute("ALTER TABLE notification_outbox ADD COLUMN source TEXT NOT NULL DEFAULT 'manual'")
         self.db.commit()
 
     def now(self) -> str:
@@ -80,9 +84,12 @@ class Store:
         return [name for name, _ in rows[:limit]]
 
     def record(self, name: str, status: str, detail: str = "", *,
-               alert_first_free: bool = False) -> tuple[str | None, bool]:
+               alert_first_free: bool = False, notification_source: str = "manual",
+               auto_candidate: bool = False) -> tuple[str | None, bool]:
         if status not in DEFINITIVE:
             raise ValueError("Нельзя сохранять временные ошибки как окончательный статус")
+        if notification_source not in ("manual", "auto"):
+            raise ValueError("Неверный источник уведомления")
         with self.db:
             row = self.db.execute("SELECT status FROM state WHERE username = ?", (name,)).fetchone()
             previous = row[0] if row and row[0] != "unknown" else None
@@ -100,30 +107,49 @@ class Store:
                 if status == "free" and (previous is not None or alert_first_free):
                     self.db.execute("""
                         INSERT INTO notification_outbox
-                            (change_id,username,previous_status,status,created_at,next_attempt_at)
-                        VALUES (?,?,?,'pending',?,?)
-                    """, (change.lastrowid, name, previous, now, now))
+                            (change_id,username,previous_status,status,created_at,next_attempt_at,source)
+                        VALUES (?,?,?,'pending',?,?,?)
+                    """, (change.lastrowid, name, previous, now, now, notification_source))
             if status != "free":
                 self.db.execute("""
                     UPDATE notification_outbox SET status='cancelled'
                     WHERE username=? AND status='pending'
                 """, (name,))
+                if previous == "free" and self.db.execute("""SELECT 1 FROM sqlite_master
+                        WHERE type='table' AND name='discovery_candidates'""").fetchone():
+                    self.db.execute("""UPDATE discovery_candidates SET status='checked',result=?,
+                        excluded_reason='definitive_result',next_check_at=NULL
+                        WHERE username=? AND status='confirmed_free'""", (status, name))
+            if auto_candidate:
+                updated = self.db.execute("""UPDATE discovery_candidates SET status=?,result=?,
+                    next_check_at=NULL,excluded_reason=? WHERE username=? AND status='checking'""",
+                    ("confirmed_free" if status == "free" else "checked", status,
+                     None if status == "free" else "definitive_result", name))
+                if updated.rowcount != 1:
+                    raise RuntimeError("Состояние автоматического кандидата изменилось во время проверки")
         return previous, changed
 
-    def cancel_unwatched(self, names: list[str]) -> None:
+    def cancel_unwatched(self, names: list[str], auto_names: list[str] | None = None) -> None:
         # Only pending events are cancelled; history and delivered events remain.
         with self.db:
             self.db.execute("CREATE TEMP TABLE IF NOT EXISTS watched_names(username TEXT PRIMARY KEY)")
             self.db.execute("DELETE FROM watched_names")
             self.db.executemany("INSERT OR IGNORE INTO watched_names VALUES (?)", ((name,) for name in names))
-            self.db.execute("""
-                UPDATE notification_outbox SET status='cancelled'
-                WHERE status='pending' AND username NOT IN (SELECT username FROM watched_names)
-            """)
+            if auto_names is None:
+                self.db.execute("""UPDATE notification_outbox SET status='cancelled'
+                    WHERE status='pending' AND username NOT IN (SELECT username FROM watched_names)""")
+            else:
+                self.db.execute("CREATE TEMP TABLE IF NOT EXISTS watched_auto(username TEXT PRIMARY KEY)")
+                self.db.execute("DELETE FROM watched_auto")
+                self.db.executemany("INSERT OR IGNORE INTO watched_auto VALUES (?)", ((name,) for name in auto_names))
+                self.db.execute("""UPDATE notification_outbox SET status='cancelled'
+                    WHERE status='pending' AND ((source='manual' AND username NOT IN
+                      (SELECT username FROM watched_names)) OR (source='auto' AND username NOT IN
+                      (SELECT username FROM watched_auto)))""")
 
     def due_notifications(self, limit: int) -> list[OutboxEvent]:
         return [OutboxEvent(*row) for row in self.db.execute("""
-            SELECT id,username,previous_status,attempts FROM notification_outbox
+            SELECT id,username,previous_status,attempts,source FROM notification_outbox
             WHERE status='pending' AND next_attempt_at <= ?
             ORDER BY next_attempt_at,id LIMIT ?
         """, (self.now(), limit)).fetchall()]

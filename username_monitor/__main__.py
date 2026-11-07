@@ -89,17 +89,34 @@ async def _check_measured(client, name, timeout, phase, telemetry, *, monotonic=
 async def one_cycle(client, config, store: Store, limit: int, telemetry=None, *, monotonic=time.monotonic) -> float:
     from telethon import errors
     from .outbox import deliver_due
+    from .discovery import pool_for
 
     names, invalid = load_names(config.usernames_path)
     if invalid:
         LOG.warning("Пропущено некорректных имён: %d (%s)", len(invalid), ", ".join(invalid[:3]))
-    store.cancel_unwatched(names)
-    selected = store.select(names, limit)
+    enabled = getattr(config, "auto_discovery_enabled", False)
+    pool = pool_for(store) if enabled else None
+    if pool is not None:
+        pool.recover()
+        pool.fill(config.auto_discovery_pool_size)
+    store.cancel_unwatched(names, pool.active_names() if pool is not None else [])
+    selected_manual = store.select(names, limit)
+    selected = [(name, False) for name in selected_manual]
+    if pool is not None and config.auto_discovery_per_cycle and len(selected) < limit:
+        auto_name = pool.pick(names, config.auto_discovery_daily_limit)
+        if auto_name is not None:
+            selected.append((auto_name, True))
     if not selected:
         LOG.warning("Список имён пуст; проверять нечего")
         return config.cycle_pause_seconds
-    LOG.info("Проверяем %d имён из %d (только чтение)", len(selected), len(names))
-    for i, name in enumerate(selected):
+    if pool is None:
+        LOG.info("Проверяем %d имён из %d (только чтение)", len(selected), len(names))
+    else:
+        LOG.info("Проверяем %d ручных и %d автоматических имён (только чтение)",
+                 len(selected_manual), len(selected) - len(selected_manual))
+    for i, (name, is_auto) in enumerate(selected):
+        if is_auto and not pool.begin(name, config.auto_discovery_daily_limit):
+            continue
         try:
             status, note = await _check_measured(client, name, config.check_timeout_seconds, "primary", telemetry,
                                                  monotonic=monotonic)
@@ -109,19 +126,27 @@ async def one_cycle(client, config, store: Store, limit: int, telemetry=None, *,
                 status, note = await _check_measured(client, name, config.check_timeout_seconds,
                                                      "confirmation", telemetry, monotonic=monotonic)
             previous, changed = store.record(name, status, note,
-                                             alert_first_free=config.alert_first_free)
+                                             alert_first_free=True if is_auto else config.alert_first_free,
+                                             notification_source="auto" if is_auto else "manual",
+                                             auto_candidate=is_auto)
             LOG.info("@%s: %s%s", name, status, f" (было {previous})" if changed else "")
         except errors.FloodWaitError as exc:
             cooldown = max(config.cycle_pause_seconds, float(exc.seconds) + 60)
+            if is_auto:
+                pool.temporary_error(name, "flood_wait", cooldown)
             store.mark_error(name, "FloodWait")
             LOG.warning("FLOOD_WAIT: прекращаем цикл; следующий запуск не раньше чем через %.0f с", cooldown)
             return cooldown
         except asyncio.TimeoutError:
+            if is_auto:
+                pool.temporary_error(name, "timeout", config.cycle_pause_seconds)
             store.mark_error(name, "TimeoutError")
             LOG.warning("@%s: превышено время проверки; цикл остановлен", name)
             return config.cycle_pause_seconds
         except Exception as exc:
             # Do not include raw exception messages (they may contain data).
+            if is_auto:
+                pool.temporary_error(name, type(exc).__name__, config.cycle_pause_seconds)
             store.mark_error(name, type(exc).__name__)
             LOG.warning("@%s: временная ошибка %s", name, type(exc).__name__)
         # Re-read the watch list immediately before delivery; it may have
@@ -198,24 +223,52 @@ def show_notifications_status(db_path: Path) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Telegram username monitor (только проверка)")
-    parser.add_argument("command", choices=["login", "check", "run", "status", "notifications-status", "metrics-status", "diagnose", "verify-transport"])
+    parser.add_argument("command", choices=["login", "check", "run", "status", "notifications-status", "metrics-status", "candidates", "diagnose", "verify-transport"])
+    parser.add_argument("candidate_action", nargs="?", choices=["generate", "list", "status"])
     parser.add_argument("--limit", type=int, default=None, help="Количество имён за цикл (не более MAX_PER_CYCLE)")
     parser.add_argument("--username", help="Имя для diagnose или verify-transport (не выводится в отчёте)")
     parser.add_argument("--reconnect", action="store_true", help="Принудительный reconnect в verify-transport")
     parser.add_argument("--idle-probe", action="store_true", help="Проверка 25 секунд простоя и периодических RPC на копии сессии")
     parser.add_argument("--hours", type=int, default=24, help="Период metrics-status в часах (по умолчанию 24)")
     parser.add_argument("--json", action="store_true", help="JSON-отчёт metrics-status")
+    parser.add_argument("--count", type=int, default=300, help="Количество кандидатов для генерации")
+    parser.add_argument("--seed", type=int, help="Seed для воспроизводимой генерации")
+    parser.add_argument("--top", type=int, default=20, help="Количество строк candidates list")
+    parser.add_argument("--category", choices=["startup", "short"], help="Фильтр категории candidates list")
+    parser.add_argument("--state", choices=["queued", "checking", "checked", "confirmed_free", "discarded", "retry"],
+                        help="Фильтр состояния candidates list")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     try:
         if args.idle_probe and args.command != "verify-transport":
             parser.error("--idle-probe доступен только для verify-transport")
-        if args.command in ("status", "notifications-status", "metrics-status"):
+        if args.command == "candidates" and args.candidate_action is None:
+            parser.error("для candidates укажите generate, list или status")
+        if args.command != "candidates" and args.candidate_action is not None:
+            parser.error("действие candidates доступно только для candidates")
+        if args.command in ("status", "notifications-status", "metrics-status", "candidates"):
             from dotenv import load_dotenv
             import os
             load_dotenv(override=False)
             db_path = Path(os.getenv("DB_PATH", "data/monitor.sqlite3"))
-            if args.command == "status":
+            if args.command == "candidates":
+                from .discovery import CandidatePool, read_pool
+                if args.candidate_action == "generate":
+                    import sqlite3
+                    from types import SimpleNamespace
+                    pool_size = int(os.getenv("AUTO_DISCOVERY_POOL_SIZE", "300"))
+                    if not 1 <= pool_size <= 1000:
+                        raise ValueError("AUTO_DISCOVERY_POOL_SIZE должен быть от 1 до 1000")
+                    db_path.parent.mkdir(parents=True, exist_ok=True)
+                    with sqlite3.connect(db_path) as db:
+                        pool = CandidatePool(SimpleNamespace(db=db, clock=lambda: datetime.now(timezone.utc)))
+                        added = pool.generate(args.count, seed=args.seed, pool_size=pool_size)
+                    print(f"Добавлено кандидатов: {added}")
+                else:
+                    print(read_pool(db_path, action=args.candidate_action, top=args.top,
+                                    category=args.category, status=args.state,
+                                    daily_limit=int(os.getenv("AUTO_DISCOVERY_DAILY_LIMIT", "12"))))
+            elif args.command == "status":
                 show_status(db_path)
             elif args.command == "notifications-status":
                 show_notifications_status(db_path)

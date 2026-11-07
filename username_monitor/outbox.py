@@ -8,6 +8,7 @@ from .names import load_names
 from . import notify as notify_module
 from .store import Store
 from .telemetry import safe_record
+from .discovery import pool_for
 
 LOG = logging.getLogger("username_monitor")
 BATCH_SIZE = 10
@@ -15,15 +16,28 @@ BATCH_SIZE = 10
 
 async def deliver_due(config, store: Store, telemetry=None) -> int:
     names, _ = load_names(config.usernames_path)
-    store.cancel_unwatched(names)
+    enabled = getattr(config, "auto_discovery_enabled", False)
+    auto_names = pool_for(store).active_names() if enabled else []
+    store.cancel_unwatched(names, auto_names)
     processed = 0
     for event in store.due_notifications(BATCH_SIZE):
         if not store.is_current_free(event):
             store.cancel_notification(event.id)
             continue
-        message = (f"🟢 Возможный свободный username: @{event.username}\n"
-                   f"До этого: {event.previous_status or 'не проверялся'}\n"
-                   "Проверь и назначь вручную в Telegram. Доступность не гарантирована.")
+        if event.source == "auto":
+            info = store.db.execute("""SELECT category,score FROM discovery_candidates
+                WHERE username=? AND status='confirmed_free'""", (event.username,)).fetchone()
+            if not info:
+                store.cancel_notification(event.id)
+                continue
+            message = (f"🟢 Возможный свободный username: @{event.username}\n"
+                       f"AutoDiscovery: {info[0]}, рейтинг {info[1]}/100\n"
+                       "Два успешных Telegram RPC подтвердили free. "
+                       "Доступность может измениться до ручного назначения.")
+        else:
+            message = (f"🟢 Возможный свободный username: @{event.username}\n"
+                       f"До этого: {event.previous_status or 'не проверялся'}\n"
+                       "Проверь и назначь вручную в Telegram. Доступность не гарантирована.")
         attempt = notify_module.HttpAttempt() if telemetry is not None else None
         notify_options = {"bot_proxy_url": config.bot_proxy_url,
                           "bot_proxy_secret": config.bot_proxy_secret}
