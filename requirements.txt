@@ -1,2 +1,4 @@
-Telethon>=1.36,<2
-python-dotenv>=1.0,<2
+Telethon==1.45.0
+python-dotenv==1.2.1
+cryptography==50.0.2
+tgnet @ git+https://github.com/nsdkinx/tgnet.git@4f3ebe77c65fcb77afa5404926b13e38f5c4f43e

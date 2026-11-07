@@ -40,6 +40,21 @@ nano usernames.txt
 
 ### MTProxy
 
+For a purchased EE/Base64 FakeTLS MTProxy, set `TG_TRANSPORT=faketls` and
+`TG_MTPROXY_HOST`, `TG_MTPROXY_PORT`, `TG_MTPROXY_SECRET_B64` in a
+root-owned systemd environment file (`/etc/username-monitor/mtproxy.env`,
+mode 0600). The last variable is read only from the process environment
+before the project `.env` is loaded; never write it to the project or Git.
+The FakeTLS TCP endpoint may differ from the Telegram DC address. The
+adapter keeps Telethon's DC ID and connects TCP to the MTProxy without SOCKS5.
+Set `TG_TRANSPORT=legacy` to restore the original `TG_PROXY_*` route (or
+direct TCP when it was not configured), or `TG_TRANSPORT=direct` for explicit
+direct TCP. The default is `legacy`. See
+[`deploy/faketls-rollout.md`](deploy/faketls-rollout.md) for an isolated
+install, session backup, authenticated read-only RPC smoke, deployment and
+rollback. The `verify-transport` command uses an SQLite backup of the
+existing session, never calls `login`, and does not change the original.
+
 Для подключения Telethon через MTProxy заполните в `.env` все три параметра:
 
 ```dotenv

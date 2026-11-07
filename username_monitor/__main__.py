@@ -16,7 +16,12 @@ def create_telegram_client(config, *, flood_sleep_threshold=None):
     from telethon import TelegramClient
 
     options = {"request_retries": 1, "connection_retries": 2, "retry_delay": 1}
-    if config.proxy_host is not None:
+    if config.tg_transport == "faketls":
+        from .faketls import connection_for_mtproxy
+        options["connection"] = connection_for_mtproxy(
+            config.mtproxy_host, config.mtproxy_port, config.mtproxy_secret
+        )
+    elif config.tg_transport == "legacy" and config.proxy_host is not None:
         from telethon.network.connection import ConnectionTcpMTProxyRandomizedIntermediate
 
         options["connection"] = ConnectionTcpMTProxyRandomizedIntermediate
@@ -118,7 +123,7 @@ def show_status(db_path: Path) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Telegram username monitor (только проверка)")
-    parser.add_argument("command", choices=["login", "check", "run", "status", "diagnose"])
+    parser.add_argument("command", choices=["login", "check", "run", "status", "diagnose", "verify-transport"])
     parser.add_argument("--limit", type=int, default=None, help="Количество имён за цикл (не более MAX_PER_CYCLE)")
     parser.add_argument("--username", help="Имя для команды diagnose (не выводится в отчёте)")
     args = parser.parse_args()
@@ -131,6 +136,9 @@ def main() -> int:
             show_status(Path(os.getenv("DB_PATH", "data/monitor.sqlite3")))
             return 0
         config = load_config()
+        if args.command == "verify-transport":
+            from .transport_probe import verify_transport
+            return asyncio.run(verify_transport(config, create_telegram_client))
         if args.command == "diagnose":
             from .diagnostics import diagnose
 
