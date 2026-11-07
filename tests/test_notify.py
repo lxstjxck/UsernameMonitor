@@ -35,6 +35,22 @@ class TestBotProxyConfig(unittest.TestCase):
         self.assertEqual(config.bot_token, "")
         self.assertNotIn(WORKER_SECRET, repr(config))
 
+    def test_chat_id_alias_and_matching_values(self):
+        alias = self.config(BOT_PROXY_URL=WORKER_URL, BOT_PROXY_SECRET=WORKER_SECRET,
+                            TG_CHAT_ID=" 123 ")
+        self.assertEqual(alias.chat_id, "123")
+        matching = self.config(BOT_TOKEN=BOT_TOKEN, CHAT_ID="123", TG_CHAT_ID=" 123 ")
+        self.assertEqual(matching.chat_id, "123")
+        self.assertEqual(self.config(BOT_TOKEN=BOT_TOKEN, TG_CHAT_ID="123").chat_id, "123")
+
+    def test_conflicting_chat_ids_fail_without_echoing_values(self):
+        with self.assertRaises(ValueError) as caught:
+            self.config(CHAT_ID="private-primary-123", TG_CHAT_ID="private-alias-456")
+        message = str(caught.exception)
+        self.assertIn("CHAT_ID и TG_CHAT_ID", message)
+        self.assertNotIn("private-primary-123", message)
+        self.assertNotIn("private-alias-456", message)
+
     def test_incomplete_or_invalid_worker_config_is_rejected(self):
         for values in (
             {"BOT_PROXY_URL": WORKER_URL},
@@ -70,6 +86,7 @@ class TestNotifications(unittest.IsolatedAsyncioTestCase):
         headers = {key.lower(): value for key, value in req.header_items()}
         self.assertEqual(headers["authorization"], "Bearer " + WORKER_SECRET)
         self.assertEqual(headers["content-type"], "application/json")
+        self.assertEqual(headers["user-agent"], "UsernameMonitor/0.1")
         self.assertEqual(json.loads(req.data), {"chat_id": "123", "text": MESSAGE})
         self.assertNotIn(BOT_TOKEN.encode(), req.data)
         self.assertEqual(opener.open.call_args.kwargs["timeout"], HTTP_TIMEOUT_SECONDS)
@@ -119,6 +136,7 @@ class TestNotifications(unittest.IsolatedAsyncioTestCase):
         self.assertIn(b"chat_id=123", req.data)
         self.assertIn(b"text=private+notification+text", req.data)
         self.assertEqual(urlopen.call_args.kwargs["timeout"], HTTP_TIMEOUT_SECONDS)
+        self.assertNotIn("User-agent", dict(req.header_items()))
 
     async def test_unconfigured_mode_does_not_log_message(self):
         with self.assertLogs("username_monitor.notify", level="WARNING") as captured:

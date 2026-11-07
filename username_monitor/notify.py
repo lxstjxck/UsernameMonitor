@@ -19,7 +19,8 @@ def _send(bot_token: str, chat_id: str, message: str,
         payload = json.dumps({"chat_id": chat_id, "text": message}).encode("utf-8")
         req = request.Request(
             f"{bot_proxy_url}/bot/sendMessage", data=payload, method="POST",
-            headers={"Authorization": f"Bearer {bot_proxy_secret}", "Content-Type": "application/json"},
+            headers={"Authorization": f"Bearer {bot_proxy_secret}", "Content-Type": "application/json",
+                     "User-Agent": "UsernameMonitor/0.1"},
         )
         opener = request.build_opener(_NoRedirect)
         response_context = opener.open(req, timeout=HTTP_TIMEOUT_SECONDS)

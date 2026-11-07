@@ -55,7 +55,11 @@ def load_config() -> Config:
     if not raw_id.isdecimal() or not api_hash:
         raise ValueError("Укажите TG_API_ID и TG_API_HASH в .env (my.telegram.org)")
     bot_token = os.getenv("BOT_TOKEN", "").strip()
-    chat_id = os.getenv("CHAT_ID", "").strip()
+    primary_chat_id = os.getenv("CHAT_ID", "").strip()
+    legacy_chat_id = os.getenv("TG_CHAT_ID", "").strip()
+    if primary_chat_id and legacy_chat_id and primary_chat_id != legacy_chat_id:
+        raise ValueError("CHAT_ID и TG_CHAT_ID заданы с разными значениями")
+    chat_id = primary_chat_id or legacy_chat_id
     bot_proxy_url = os.getenv("BOT_PROXY_URL", "").strip()
     bot_proxy_secret = os.getenv("BOT_PROXY_SECRET", "").strip()
     if bool(bot_proxy_url) != bool(bot_proxy_secret):

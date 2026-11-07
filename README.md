@@ -85,6 +85,11 @@ BOT_PROXY_URL=https://username-monitor-proxy.svjack69.workers.dev
 BOT_PROXY_SECRET=your-worker-secret
 ```
 
+`TG_CHAT_ID` также принимается как альтернативное имя настройки. Если заданы
+обе переменные, их значения должны совпадать; при конфликте запуск
+останавливается без вывода идентификаторов. Запросы к Worker отправляются с
+`User-Agent: UsernameMonitor/0.1`.
+
 `BOT_PROXY_URL` — только HTTPS-адрес Worker без пути `/bot/sendMessage`, параметров запроса и учётных данных. Монитор добавляет маршрут `/bot/sendMessage` сам, отправляет POST JSON с `chat_id` и `text` и заголовок `Authorization: Bearer <BOT_PROXY_SECRET>`. В этом режиме `BOT_TOKEN` не требуется и не передаётся Worker. Если обе настройки Worker пусты, сохраняется прямая отправка через Telegram Bot API. Заполнить нужно обе настройки Worker; неполная конфигурация останавливает запуск с ошибкой.
 
 Время ожидания HTTP-запроса ограничено 15 секундами. Успехом считается только HTTP 2xx с JSON `{"ok":true}`; ошибка доставки записывается без токенов, секретов, заголовков и текста уведомления. Автоматических повторов отправки нет: после сбоя уведомление может быть пропущено, поскольку статус имени уже записан. Маршрут `/apiws` и настройки MTProxy этой опцией не затрагиваются.
@@ -101,7 +106,7 @@ sudo systemctl status telegram-username-monitor
 sudo journalctl -u telegram-username-monitor -f
 ```
 
-Скрипт предназначен для первичной установки: он создаёт unit `telegram-username-monitor.service` и сразу запускает его. Для перехода уже работающего сервиса на FakeTLS не запускайте этот скрипт; сначала определите фактическое имя unit и следуйте [плану развёртывания](deploy/faketls-rollout.md). Для остановки установленного таким способом unit:
+Этот скрипт создаёт unit `telegram-username-monitor.service` и сразу запускает его. Для первого production-запуска FakeTLS на московском VPS используйте [отдельную инструкцию](deploy/first-production-systemd.md), создающую `username-monitor.service`. Для перехода уже работающего сервиса сначала определите фактическое имя unit и следуйте [плану развёртывания](deploy/faketls-rollout.md). Для остановки установленного скриптом unit:
 
 ```bash
 sudo systemctl stop telegram-username-monitor

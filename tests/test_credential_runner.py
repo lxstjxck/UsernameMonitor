@@ -40,6 +40,23 @@ class TestCredentialRunner(unittest.TestCase):
         self.assertIn("credential unavailable", output.getvalue())
         execv.assert_not_called()
 
+    def test_username_option_is_not_abbreviated_as_usernames_path(self):
+        with tempfile.TemporaryDirectory() as root:
+            Path(root, "mtproxy_secret_b64").write_text("private-synthetic-value\n")
+            with patch.dict(os.environ, {"CREDENTIALS_DIRECTORY": root}, clear=True), \
+                    patch("sys.argv", [str(RUNNER), "--mtproxy-host", "45.130.124.28",
+                                       "--mtproxy-port", "443", "--session-path", "/tmp/backup",
+                                       "verify-transport", "--username", "testusername12345",
+                                       "--reconnect"]), \
+                    patch("os.execv") as execv:
+                main()
+                self.assertNotIn("USERNAMES_PATH", os.environ)
+                self.assertEqual(
+                    execv.call_args.args[1][-5:],
+                    ["username_monitor", "verify-transport", "--username",
+                     "testusername12345", "--reconnect"],
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

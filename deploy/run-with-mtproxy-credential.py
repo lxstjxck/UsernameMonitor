@@ -7,7 +7,7 @@ import sys
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(add_help=False)
+    parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
     parser.add_argument("--mtproxy-host", required=True)
     parser.add_argument("--mtproxy-port", required=True)
     parser.add_argument("--session-path")
