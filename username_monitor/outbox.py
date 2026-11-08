@@ -9,6 +9,7 @@ from . import notify as notify_module
 from .store import Store
 from .telemetry import safe_record
 from .discovery import pool_for
+from .free_summary import format_top_confirmed_free
 
 LOG = logging.getLogger("username_monitor")
 BATCH_SIZE = 10
@@ -32,8 +33,8 @@ async def deliver_due(config, store: Store, telemetry=None) -> int:
                 continue
             message = (f"🟢 Возможный свободный username: @{event.username}\n"
                        f"AutoDiscovery: {info[0]}, рейтинг {info[1]}/100\n"
-                       "Два успешных Telegram RPC подтвердили free. "
-                       "Доступность может измениться до ручного назначения.")
+                       "Два успешных Telegram RPC подтвердили free.\n\n"
+                       f"{format_top_confirmed_free(store.db)}")
         else:
             message = (f"🟢 Возможный свободный username: @{event.username}\n"
                        f"До этого: {event.previous_status or 'не проверялся'}\n"
