@@ -34,6 +34,7 @@ class Config:
     auto_discovery_per_cycle: int = 1
     auto_discovery_daily_limit: int = 12
     auto_discovery_pool_size: int = 300
+    auto_discovery_promoted_first: bool = False
     market_discovery_enabled: bool = False
 
 
@@ -130,5 +131,6 @@ def load_config() -> Config:
         auto_discovery_per_cycle=_int_env("AUTO_DISCOVERY_PER_CYCLE", 1, 0, 1),
         auto_discovery_daily_limit=_int_env("AUTO_DISCOVERY_DAILY_LIMIT", 12, 1, 12),
         auto_discovery_pool_size=_int_env("AUTO_DISCOVERY_POOL_SIZE", 300, 1, 1000),
+        auto_discovery_promoted_first=os.getenv("AUTO_DISCOVERY_PROMOTED_FIRST", "false").lower() in ("1", "true", "yes"),
         market_discovery_enabled=os.getenv("MARKET_DISCOVERY_ENABLED", "false").lower() in ("1", "true", "yes"),
     )

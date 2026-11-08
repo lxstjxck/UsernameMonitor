@@ -203,6 +203,54 @@ class MarketCase(unittest.TestCase):
                                  ((NOW - timedelta(days=31)).isoformat(), alternative))
             self.assertEqual(pool.pick([], 12, market=True), initial)
 
+    def test_promoted_first_with_default_market_retry_and_cooldown(self):
+        clock = [NOW]
+        with Store(self.path, clock=lambda: clock[0]) as store:
+            pool = CandidatePool(store)
+            with store.db:
+                store.db.executemany("""INSERT INTO discovery_candidates
+                    (username,category,score,reason,generated_at,status,origin)
+                    VALUES (?,'startup',?,'fixture',?,'queued',?)""",
+                    [(name, score, NOW.isoformat(), origin) for name, score, origin in
+                     (("normalhigh", 99, "v1"), ("normallow", 50, "v1"),
+                      ("promotedlo", 62, "market_test"), ("promotedhi", 80, "market_test"))])
+            self.assertEqual(pool.pick([], 12), "normalhigh")
+            self.assertEqual(pool.pick([], 12, promoted_first=True), "promotedhi")
+            self.assertEqual(pool.pick(["promotedhi"], 12, promoted_first=True), "promotedlo")
+            # A misleading fresh TOP sample has no right to change either group.
+            with store.db:
+                store.db.execute("""CREATE TABLE market_candidate_scores (
+                    username TEXT PRIMARY KEY, commercial_score INTEGER, status TEXT,
+                    confidence TEXT, reason TEXT,source TEXT,obtained_at TEXT,scored_at TEXT)""")
+                store.db.execute("INSERT INTO market_candidate_scores VALUES (?,?,?,?,?,?,?,?)",
+                                 ("promotedlo", 100, "insufficient_data", "none", "top_sample", "fixture",
+                                  NOW.isoformat(), NOW.isoformat()))
+            self.assertEqual(pool.pick([], 12, market=True, promoted_first=True), "promotedhi")
+            with store.db:
+                store.db.execute("UPDATE market_candidate_scores SET status='observed',confidence='medium'"
+                                 " WHERE username='promotedlo'")
+            # Promotion priority and name_score within its group win even over
+            # a hypothetical verified commercial score on the lower candidate.
+            self.assertEqual(pool.pick([], 12, market=True, promoted_first=True), "promotedhi")
+            self.assertTrue(pool.begin("promotedhi", 12))
+            pool.temporary_error("promotedhi", "timeout", 3000)
+            self.assertIsNone(pool.pick([], 12, promoted_first=True))
+            clock[0] += timedelta(seconds=7200)
+            # The retry is due after 3000 seconds, and outranks the lower score.
+            self.assertEqual(pool.pick([], 12, market=True, promoted_first=True), "promotedhi")
+            with store.db:
+                store.db.execute("UPDATE discovery_candidates SET status='checked' WHERE username='promotedhi'")
+                store.db.execute("UPDATE discovery_candidates SET status='retry',next_check_at=? WHERE username='promotedlo'",
+                                 ((clock[0] + timedelta(seconds=500)).isoformat(),))
+            self.assertEqual(pool.pick([], 12, promoted_first=True), "normalhigh")
+            clock[0] += timedelta(seconds=500)
+            self.assertEqual(pool.pick([], 12, promoted_first=True), "promotedlo")
+            with store.db:
+                store.db.execute("UPDATE discovery_candidates SET status='checked' WHERE username='promotedlo'")
+            self.assertEqual(pool.pick([], 12, promoted_first=True), "normalhigh")
+            self.assertEqual(pool.remaining(12), 11)
+            self.assertEqual(store.db.execute("PRAGMA integrity_check").fetchone()[0], "ok")
+
     def test_promotion_dry_run_atomic_history_and_capacity(self):
         with Store(self.path, clock=lambda: NOW) as store:
             pool = CandidatePool(store)

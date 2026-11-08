@@ -175,8 +175,12 @@ class DiscoveryCase(unittest.IsolatedAsyncioTestCase):
         with patch.dict(os.environ, base, clear=True), patch("username_monitor.config.load_dotenv"):
             cfg = load_config()
         self.assertFalse(cfg.auto_discovery_enabled)
+        self.assertFalse(cfg.auto_discovery_promoted_first)
         self.assertEqual((cfg.auto_discovery_per_cycle, cfg.auto_discovery_daily_limit,
                           cfg.auto_discovery_pool_size), (1, 12, 300))
+        with patch.dict(os.environ, base | {"AUTO_DISCOVERY_PROMOTED_FIRST": "true"}, clear=True), \
+                patch("username_monitor.config.load_dotenv"):
+            self.assertTrue(load_config().auto_discovery_promoted_first)
         for key, value in (("AUTO_DISCOVERY_PER_CYCLE", "2"),
                            ("AUTO_DISCOVERY_DAILY_LIMIT", "13"),
                            ("AUTO_DISCOVERY_POOL_SIZE", "1001")):
@@ -336,6 +340,45 @@ class DiscoveryCase(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(called, ["manual123", auto, "manual123"])
             self.assertEqual(pool.remaining(12), 11)
 
+    async def test_promoted_priority_survives_fill_and_preserves_old_results(self):
+        from username_monitor.market_generation import persist_test_pool, promote
+
+        self.config.auto_discovery_pool_size = 300
+        self.config.auto_discovery_promoted_first = True
+        with self.store() as store:
+            pool = CandidatePool(store)
+            pool.generate(300, seed=42, pool_size=300)
+            persist_test_pool(store.db, 40, 42, clock=self.clock.now)
+            promote(store.db, count=2, pool_size=300, manual=["manual123"], clock=self.clock.now)
+            first = pool.pick(["manual123"], 12, promoted_first=True)
+            self.assertEqual(store.db.execute("SELECT origin FROM discovery_candidates WHERE username=?",
+                                              (first,)).fetchone()[0], "market_test")
+            store.record("oldname", "free", alert_first_free=True)
+            event = store.due_notifications(1)[0]
+            store.delivered(event.id)
+            prior = {table: list(store.db.execute(f"SELECT * FROM {table} WHERE username='oldname'"))
+                     for table in ("state", "changes", "notification_outbox")}
+            called = []
+
+            async def check(_client, name):
+                called.append(name)
+                return "occupied", ""
+
+            with patch("username_monitor.telegram_api.check_username", side_effect=check), \
+                    patch("username_monitor.__main__.asyncio.sleep", new_callable=AsyncMock):
+                self.assertEqual(await one_cycle(object(), self.config, store, 2), 600)
+                self.clock.advance(600)
+                self.assertEqual(await one_cycle(object(), self.config, store, 2), 600)
+            self.assertEqual(called, ["manual123", first, "manual123"])
+            self.assertEqual({table: list(store.db.execute(f"SELECT * FROM {table} WHERE username='oldname'"))
+                              for table in prior}, prior)
+            self.clock.advance(6600)
+            second = pool.pick(["manual123"], 12, promoted_first=True)
+            self.assertIsNotNone(second)
+            self.assertNotEqual(second, first)
+            self.assertEqual(store.db.execute("SELECT origin FROM discovery_candidates WHERE username=?",
+                                              (second,)).fetchone()[0], "market_test")
+
     async def test_disabled_never_uses_auto_rpc_and_cancels_only_auto_alert(self):
         with self.store() as store:
             pool, auto = self.seeded(store)
@@ -345,6 +388,7 @@ class DiscoveryCase(unittest.IsolatedAsyncioTestCase):
                          notification_source="auto", auto_candidate=True)
             store.record("manual123", "free", alert_first_free=True)
             self.config.auto_discovery_enabled = False
+            self.config.auto_discovery_promoted_first = True
             with patch("username_monitor.telegram_api.check_username", new_callable=AsyncMock,
                        return_value=("free", "")) as rpc, \
                     patch("username_monitor.__main__.asyncio.sleep", new_callable=AsyncMock), \

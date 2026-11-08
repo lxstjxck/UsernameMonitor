@@ -104,7 +104,8 @@ async def one_cycle(client, config, store: Store, limit: int, telemetry=None, *,
     selected = [(name, False) for name in selected_manual]
     if pool is not None and config.auto_discovery_per_cycle and len(selected) < limit:
         auto_name = pool.pick(names, config.auto_discovery_daily_limit,
-                              market=getattr(config, "market_discovery_enabled", False))
+                              market=getattr(config, "market_discovery_enabled", False),
+                              promoted_first=getattr(config, "auto_discovery_promoted_first", False))
         if auto_name is not None:
             selected.append((auto_name, True))
     if not selected:

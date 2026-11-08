@@ -332,20 +332,30 @@ class CandidatePool:
                         SELECT 1 FROM state WHERE state.username=discovery_candidates.username
                           AND state.status IN ('free','occupied','unavailable','invalid','fragment'))""")
 
-    def pick(self, manual: list[str], daily_limit: int, *, market: bool = False) -> str | None:
+    def pick(self, manual: list[str], daily_limit: int, *, market: bool = False,
+             promoted_first: bool = False) -> str | None:
         if self.remaining(daily_limit) == 0 or not self.interval_ready():
             return None
         blocked = set(manual)
+        promoted_order = "CASE WHEN c.origin='market_test' THEN 0 ELSE 1 END," if promoted_first else ""
+        market_gate = "c.origin!='market_test' AND " if promoted_first else ""
         if market and self.db.execute("""SELECT 1 FROM sqlite_master
                 WHERE type='table' AND name='market_candidate_scores'""").fetchone():
             cutoff = (self.clock().astimezone(timezone.utc) - timedelta(days=30)).isoformat()
-            return next((name for (name,) in self.db.execute("""SELECT c.username
+            return next((name for (name,) in self.db.execute(f"""SELECT c.username
                 FROM discovery_candidates c LEFT JOIN market_candidate_scores m
                   ON m.username=c.username AND m.obtained_at>=? AND m.scored_at<=?
                 WHERE (c.status='queued' OR (c.status='retry' AND c.next_check_at<=?))
-                ORDER BY COALESCE(CASE WHEN m.status='observed' AND m.confidence='medium'
+                ORDER BY {promoted_order} COALESCE(CASE
+                    WHEN {market_gate} m.status='observed' AND m.confidence='medium'
                     THEN m.commercial_score END,c.score) DESC,c.score DESC,c.generated_at,c.username
                 LIMIT 1000""", (cutoff, self.now(), self.now())) if name not in blocked), None)
+        if promoted_first:
+            return next((name for (name,) in self.db.execute("""SELECT c.username FROM discovery_candidates c
+                WHERE c.status='queued' OR (c.status='retry' AND c.next_check_at<=?)
+                ORDER BY CASE WHEN c.origin='market_test' THEN 0 ELSE 1 END,
+                         c.score DESC,c.generated_at,c.username LIMIT 1000""", (self.now(),))
+                         if name not in blocked), None)
         return next((name for (name,) in self.db.execute("""SELECT username FROM discovery_candidates
             WHERE status='queued' OR (status='retry' AND next_check_at<=?)
             ORDER BY score DESC, generated_at, username LIMIT 1000""", (self.now(),)) if name not in blocked), None)
