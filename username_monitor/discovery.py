@@ -200,7 +200,10 @@ class CandidatePool:
                 attempts INTEGER NOT NULL DEFAULT 0,
                 excluded_reason TEXT,
                 next_check_at TEXT,
-                score_version INTEGER NOT NULL DEFAULT 2
+                score_version INTEGER NOT NULL DEFAULT 2,
+                origin TEXT NOT NULL DEFAULT 'v1',
+                market_class TEXT,
+                promotion_reason TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_discovery_queue
                 ON discovery_candidates(status,score DESC,next_check_at);
@@ -212,6 +215,12 @@ class CandidatePool:
         if "score_version" not in {row[1] for row in self.db.execute("PRAGMA table_info(discovery_candidates)")}:
             self.db.execute("ALTER TABLE discovery_candidates ADD COLUMN score_version INTEGER NOT NULL DEFAULT 1")
             self.db.commit()
+        columns = {row[1] for row in self.db.execute("PRAGMA table_info(discovery_candidates)")}
+        for column, definition in (("origin", "TEXT NOT NULL DEFAULT 'v1'"),
+                                   ("market_class", "TEXT"), ("promotion_reason", "TEXT")):
+            if column not in columns:
+                self.db.execute(f"ALTER TABLE discovery_candidates ADD COLUMN {column} {definition}")
+        self.db.commit()
         self._has_state = bool(self.db.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='state'").fetchone())
 
@@ -294,6 +303,13 @@ class CandidatePool:
         used = self.db.execute("SELECT COUNT(*) FROM discovery_attempts WHERE started_at > ?", (cutoff,)).fetchone()[0]
         return max(0, daily_limit - used)
 
+    def interval_ready(self, seconds: int = 7200) -> bool:
+        row = self.db.execute("SELECT MAX(started_at) FROM discovery_attempts").fetchone()
+        if not row or row[0] is None:
+            return True
+        last = datetime.fromisoformat(row[0])
+        return self.clock().astimezone(timezone.utc) >= last + timedelta(seconds=seconds)
+
     def recover(self):
         # Only the single monitor process calls this. An interrupted attempt was
         # already counted; a recorded definitive result must not be rechecked.
@@ -317,7 +333,7 @@ class CandidatePool:
                           AND state.status IN ('free','occupied','unavailable','invalid','fragment'))""")
 
     def pick(self, manual: list[str], daily_limit: int, *, market: bool = False) -> str | None:
-        if self.remaining(daily_limit) == 0:
+        if self.remaining(daily_limit) == 0 or not self.interval_ready():
             return None
         blocked = set(manual)
         if market and self.db.execute("""SELECT 1 FROM sqlite_master
@@ -327,8 +343,8 @@ class CandidatePool:
                 FROM discovery_candidates c LEFT JOIN market_candidate_scores m
                   ON m.username=c.username AND m.obtained_at>=? AND m.scored_at<=?
                 WHERE (c.status='queued' OR (c.status='retry' AND c.next_check_at<=?))
-                  AND (m.status IS NULL OR m.status!='excluded')
-                ORDER BY COALESCE(m.commercial_score,c.score) DESC,c.score DESC,c.generated_at,c.username
+                ORDER BY COALESCE(CASE WHEN m.status='observed' AND m.confidence='medium'
+                    THEN m.commercial_score END,c.score) DESC,c.score DESC,c.generated_at,c.username
                 LIMIT 1000""", (cutoff, self.now(), self.now())) if name not in blocked), None)
         return next((name for (name,) in self.db.execute("""SELECT username FROM discovery_candidates
             WHERE status='queued' OR (status='retry' AND next_check_at<=?)
@@ -338,7 +354,7 @@ class CandidatePool:
         # Reserve a rolling-window slot at the point the logical RPC starts.
         with self.db:
             self.db.execute("BEGIN IMMEDIATE")
-            if self.remaining(daily_limit) == 0:
+            if self.remaining(daily_limit) == 0 or not self.interval_ready():
                 return False
             changed = self.db.execute("""UPDATE discovery_candidates SET status='checking',
                 attempts=attempts+1,last_checked_at=? WHERE username=? AND

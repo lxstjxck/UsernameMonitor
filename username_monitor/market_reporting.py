@@ -96,7 +96,10 @@ def compare(db, *, as_of=None, top=20, pool="auto"):
                             commercial_score=item["score"], confidence=item["confidence"],
                             evidence_status=item["status"], reason=item["reason"]))
     v1 = sorted(records, key=lambda r: (-r["name_score"], r["username"]))[:top]
-    v2 = _balanced_top(records, min(top, len(records)))
+    # With no trusted comparable evidence, the experimental report must also
+    # preserve the exact v1 ordering (not just the runtime queue).
+    v2 = (_balanced_top(records, min(top, len(records))) if any(
+        row["commercial_score"] is not None for row in records) else v1)
     sample = []
     if snapshot:
         sample = [classify(row[0]) for row in db.execute("""SELECT username FROM market_sales

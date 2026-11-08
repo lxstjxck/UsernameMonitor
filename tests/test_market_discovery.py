@@ -13,8 +13,8 @@ from unittest.mock import patch
 from username_monitor.__main__ import main
 from username_monitor.discovery import CandidatePool
 from username_monitor.market_analysis import Evidence, analyze_sales, commercial_rating, unsafe_name
-from username_monitor.market_data import import_daily, latest, market_status, validate_daily
-from username_monitor.market_generation import generate_market, persist_test_pool
+from username_monitor.market_data import import_daily, latest, market_status, market_exclusions, migrate, validate_daily
+from username_monitor.market_generation import generate_market, persist_test_pool, promotion_plan, promote
 from username_monitor.market_reporting import compare, explain, score_unchecked
 from username_monitor.store import Store
 
@@ -52,6 +52,7 @@ class MarketCase(unittest.TestCase):
             self.assertEqual(db.execute("SELECT COUNT(*) FROM market_auctions").fetchone()[0], 1)
             self.assertEqual(db.execute("SELECT exclusion_reason FROM market_sales WHERE username='telegramofficial'").fetchone()[0],
                              "invalid_or_identity_risk")
+            self.assertEqual(market_exclusions(db)["excluded"][0]["kind"], "sale")
             self.assertEqual(db.execute("SELECT price_gram FROM market_sales WHERE username='disc'").fetchone()[0], 16000)
             self.assertEqual(db.execute("SELECT bid_gram FROM market_auctions").fetchone()[0], 950)
             self.assertEqual(db.execute("SELECT median_gram FROM market_aggregates WHERE bucket='len4'").fetchone()[0], 6732)
@@ -84,6 +85,23 @@ class MarketCase(unittest.TestCase):
             reasons = dict(db.execute("SELECT username,exclusion_reason FROM market_sales"))
             self.assertEqual(reasons["descent"], "duplicate_in_snapshot")
             self.assertEqual(reasons["luminous"], "unusual_price_requires_review")
+            self.assertEqual({item["reason"] for item in market_exclusions(db)["excluded"]},
+                             {"duplicate_in_snapshot", "unusual_price_requires_review", "invalid_or_identity_risk",
+                              "collectible_length4_not_comparable"})
+
+    def test_existing_v2_cache_gets_additive_exclusion_migration(self):
+        with sqlite3.connect(self.path) as db:
+            import_daily(db, feed(), now=NOW)
+            db.execute("DROP TABLE market_exclusions")
+            self.assertIn("invalid_or_identity_risk",
+                          {entry["reason"] for entry in market_exclusions(db)["excluded"]})
+            original_sales = db.execute("SELECT COUNT(*) FROM market_sales").fetchone()[0]
+            original_excluded = db.execute("SELECT COUNT(*) FROM market_sales WHERE exclusion_reason IS NOT NULL"
+                                           ).fetchone()[0]
+            migrate(db)
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM market_sales").fetchone()[0], original_sales)
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM market_exclusions").fetchone()[0], original_excluded)
+            self.assertEqual(db.execute("PRAGMA integrity_check").fetchone()[0], "ok")
 
     def test_market_generator_mix_seed_and_safety(self):
         first = generate_market(300, 42)
@@ -123,6 +141,10 @@ class MarketCase(unittest.TestCase):
                                            observed_at=NOW - timedelta(days=31))["score"], None)
         self.assertEqual(commercial_rating("telegramofficial", 80, evidence, as_of=NOW,
                                            observed_at=NOW)["status"], "excluded")
+        self.assertIsNone(commercial_rating("amber", 80, Evidence("insufficient_data"),
+                                             as_of=NOW, observed_at=NOW)["score"])
+        self.assertIsNone(commercial_rating("amber", 80, Evidence("observed", 5, 12, 1, "thin", "low"),
+                                             as_of=NOW, observed_at=NOW)["score"])
 
     def test_same_pool_compare_readonly_and_no_future_leak(self):
         with Store(self.path, clock=lambda: NOW) as store:
@@ -135,14 +157,14 @@ class MarketCase(unittest.TestCase):
                 self.assertEqual(score_unchecked(db, clock=lambda: NOW), 20)
                 self.assertEqual(db.execute("SELECT COUNT(*) FROM state").fetchone()[0], before)
                 self.assertEqual(db.execute("SELECT COUNT(*) FROM market_candidate_scores").fetchone()[0], 20)
+                self.assertEqual(db.execute("SELECT COUNT(*) FROM market_candidate_scores WHERE commercial_score IS NOT NULL"
+                                            ).fetchone()[0], 0)
                 result = compare(db, as_of=NOW, top=20)
                 self.assertEqual(result["count"], 40)
                 self.assertEqual(result["valuation"], "insufficient_data")
                 self.assertEqual(result["observed_sales_sample"]["count_5plus"], 1)
                 self.assertTrue(result["v2"]["top"][0]["reason"])
-                self.assertNotEqual(result["v1"]["top"], result["v2"]["top"])
-                self.assertEqual(result["v2"]["quality"]["categories"],
-                                 {"word": 8, "semantic": 6, "brand": 4, "thematic": 2})
+                self.assertEqual(result["v1"]["top"], result["v2"]["top"])
                 historic = compare(db, as_of=NOW - timedelta(days=1), top=20)
                 self.assertEqual(historic["status"], "no_candidates_at_cutoff")
                 # Move only the synthetic test pool's creation time backward:
@@ -170,11 +192,96 @@ class MarketCase(unittest.TestCase):
                                  (alternative, 100, "insufficient_data", "none", "heuristic_only", "fixture",
                                   NOW.isoformat(), NOW.isoformat()))
             self.assertEqual(pool.pick([], 12), initial)
+            self.assertEqual(pool.pick([], 12, market=True), initial)
+            with store.db:
+                store.db.execute("UPDATE market_candidate_scores SET status='observed',confidence='medium'"
+                                 " WHERE username=?", (alternative,))
             self.assertEqual(pool.pick([], 12, market=True), alternative)
             self.assertEqual(pool.remaining(12), 12)
-            self.assertEqual(pool.pick([], 12, market=True), alternative)  # no quota until begin()
+            with store.db:
+                store.db.execute("UPDATE market_candidate_scores SET obtained_at=? WHERE username=?",
+                                 ((NOW - timedelta(days=31)).isoformat(), alternative))
+            self.assertEqual(pool.pick([], 12, market=True), initial)
+
+    def test_promotion_dry_run_atomic_history_and_capacity(self):
+        with Store(self.path, clock=lambda: NOW) as store:
+            pool = CandidatePool(store)
+            pool.generate(10, seed=42, pool_size=10)
+            persist_test_pool(store.db, 40, 42, clock=lambda: NOW)
+            existing = store.db.execute("SELECT username FROM market_test_candidates LIMIT 1").fetchone()[0]
+            with store.db:
+                store.db.execute("""INSERT INTO discovery_candidates
+                    (username,category,score,reason,generated_at,status,last_checked_at,attempts)
+                    VALUES (?,'startup',30,'historical',?,'confirmed_free',?,3)""",
+                    (existing, NOW.isoformat(), NOW.isoformat()))
+            store.record(existing, "free", alert_first_free=True)
+            before = {table: list(store.db.execute(f"SELECT * FROM {table}")) for table in
+                      ("state", "changes", "notification_outbox", "discovery_attempts")}
+            old = store.db.execute("SELECT * FROM discovery_candidates WHERE username=?", (existing,)).fetchone()
+            plan = promotion_plan(store.db, count=20, pool_size=30, manual=["amber"])
+            self.assertEqual(plan["new_count"], 20)
+            self.assertNotIn(existing, [r["username"] for r in plan["candidates"]])
+            self.assertEqual(store.db.execute("SELECT COUNT(*) FROM discovery_candidates").fetchone()[0], 11)
+            result = promote(store.db, count=20, pool_size=30, manual=["amber"], clock=lambda: NOW)
+            self.assertEqual(result, plan)
+            self.assertEqual(store.db.execute("SELECT * FROM discovery_candidates WHERE username=?",
+                                              (existing,)).fetchone(), old)
+            self.assertEqual({table: list(store.db.execute(f"SELECT * FROM {table}")) for table in before}, before)
+            self.assertTrue(all(source == "market_test" and kind and reason for source, kind, reason in
+                                store.db.execute("SELECT origin,market_class,promotion_reason FROM discovery_candidates"
+                                                 " WHERE origin='market_test'")))
+            promote(store.db, count=20, pool_size=30, clock=lambda: NOW)
+            self.assertEqual(store.db.execute("SELECT COUNT(DISTINCT username) FROM discovery_candidates"
+                                              ).fetchone()[0], store.db.execute(
+                "SELECT COUNT(*) FROM discovery_candidates").fetchone()[0])
+            self.assertLessEqual(store.db.execute("SELECT COUNT(*) FROM discovery_candidates WHERE status='queued'"
+                                               ).fetchone()[0], 30)
+            self.assertEqual(store.db.execute("PRAGMA integrity_check").fetchone()[0], "ok")
+
+    def test_full_pool_replaces_only_never_started_rows(self):
+        with Store(self.path, clock=lambda: NOW) as store:
+            pool = CandidatePool(store)
+            pool.generate(300, seed=42, pool_size=300)
+            persist_test_pool(store.db, 40, 42, clock=lambda: NOW)
+            old = pool.pick([], 12)
+            self.assertTrue(pool.begin(old, 12))
+            pool.temporary_error(old, "timeout", 600)
+            old_row = store.db.execute("SELECT * FROM discovery_candidates WHERE username=?", (old,)).fetchone()
+            plan = promotion_plan(store.db, count=10, pool_size=300)
+            self.assertEqual(plan["new_count"], 10)
+            self.assertEqual(len(plan["replaced"]), 10)
+            self.assertNotIn(old, [row["username"] for row in plan["replaced"]])
+            promote(store.db, count=10, pool_size=300, clock=lambda: NOW)
+            self.assertEqual(store.db.execute("SELECT * FROM discovery_candidates WHERE username=?",
+                                              (old,)).fetchone(), old_row)
+            self.assertEqual(store.db.execute("SELECT COUNT(*) FROM discovery_candidates WHERE status='queued' OR status='retry'"
+                                              ).fetchone()[0], 300)
+            self.assertEqual(store.db.execute("SELECT COUNT(*) FROM discovery_candidates WHERE excluded_reason='market_promotion_replacement'"
+                                              ).fetchone()[0], 10)
+            self.assertEqual(store.db.execute("PRAGMA integrity_check").fetchone()[0], "ok")
+
+    def test_interval_and_rolling_quota_after_restart(self):
+        with Store(self.path, clock=lambda: NOW) as store:
+            pool = CandidatePool(store)
+            pool.generate(12, seed=42, pool_size=12)
+            name = pool.pick([], 12)
+            self.assertTrue(pool.begin(name, 12))
+            pool.temporary_error(name, "timeout", 600)
+        clock = [NOW + timedelta(seconds=7199)]
+        with Store(self.path, clock=lambda: clock[0]) as reopened:
+            pool = CandidatePool(reopened)
+            self.assertIsNone(pool.pick([], 12))
+            self.assertFalse(pool.begin(name, 12))
+            self.assertEqual(pool.remaining(12), 11)
+            clock[0] += timedelta(seconds=1)
+            self.assertIsNotNone(pool.pick([], 12))
+            self.assertTrue(pool.begin(name, 12))
+            self.assertEqual(pool.remaining(12), 10)
+            self.assertEqual(reopened.db.execute("SELECT COUNT(*) FROM discovery_attempts").fetchone()[0], 2)
 
     def test_local_cli_no_mtproto_and_readonly_reports(self):
+        manual = self.path.parent / "usernames.txt"
+        manual.write_text("manual123\n")
         with patch.dict(os.environ, {"DB_PATH": str(self.path)}, clear=True), \
                 patch("dotenv.load_dotenv"), \
                 patch("username_monitor.__main__.load_config", side_effect=AssertionError("secret")), \
@@ -188,6 +295,26 @@ class MarketCase(unittest.TestCase):
             with sqlite3.connect(self.path) as db:
                 self.assertEqual(db.execute("SELECT COUNT(*) FROM market_test_candidates").fetchone()[0], 40)
                 self.assertEqual(db.execute("SELECT COUNT(*) FROM sqlite_master WHERE name='notification_outbox'").fetchone()[0], 0)
+        env = {"DB_PATH": str(self.path), "USERNAMES_PATH": str(manual)}
+        with patch.dict(os.environ, env, clear=True), patch("dotenv.load_dotenv"), \
+                patch("username_monitor.__main__.load_config", side_effect=AssertionError("secret")), \
+                patch("username_monitor.__main__.create_telegram_client", side_effect=AssertionError("network")):
+            with patch("sys.argv", ["username_monitor", "market", "promote", "--count", "4", "--dry-run"]), \
+                    redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(main(), 0)
+                self.assertEqual(json.loads(output.getvalue())["new_count"], 4)
+            with sqlite3.connect(self.path) as db:
+                self.assertFalse(db.execute("SELECT 1 FROM sqlite_master WHERE name='discovery_candidates'").fetchone())
+            with patch("sys.argv", ["username_monitor", "market", "promote", "--count", "4", "--apply"]), \
+                    redirect_stdout(io.StringIO()):
+                self.assertEqual(main(), 1)
+            with patch.dict(os.environ, {**env, "MARKET_DISCOVERY_ENABLED": "true"}, clear=True), \
+                    patch("sys.argv", ["username_monitor", "market", "promote", "--count", "4", "--apply"]), \
+                    redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(main(), 0)
+                self.assertEqual(json.loads(output.getvalue())["new_count"], 4)
+            with sqlite3.connect(self.path) as db:
+                self.assertEqual(db.execute("SELECT COUNT(*) FROM discovery_candidates").fetchone()[0], 4)
 
 
 if __name__ == "__main__":

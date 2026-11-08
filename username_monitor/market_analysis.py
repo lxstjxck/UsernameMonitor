@@ -108,12 +108,14 @@ def commercial_rating(name: str, name_score: int, evidence: Evidence, *, as_of: 
         return dict(score=None, confidence="none", status="insufficient_data",
                     reason="stale_cache" if observed_at and as_of - observed_at > timedelta(days=30)
                     else "no_verified_cache")
+    if evidence.status != "observed" or evidence.confidence != "medium":
+        return dict(score=None, confidence=evidence.confidence, status="insufficient_data",
+                    reason=evidence.reason)
     # This 0–100 score is a priority signal, never a price/ROI prediction.
     bonus = {"word": 12, "semantic": 8, "brand": 3, "thematic": 4}[category]
-    liquidity = min(10, evidence.count // 5) if evidence.status == "observed" else 0
+    liquidity = min(10, evidence.count // 5)
     score = max(0, min(100, round(name_score * .75 + bonus + liquidity)))
-    return dict(score=score, confidence=evidence.confidence if evidence.status == "observed" else "none",
-                status=evidence.status,
+    return dict(score=score, confidence=evidence.confidence, status="observed",
                 reason=f"category={category}; evidence={evidence.reason}; completed_sales={evidence.count}; "
                        f"median_gram={evidence.median_gram}; spread={evidence.spread}; "
                        f"liquidity={evidence.liquidity}")

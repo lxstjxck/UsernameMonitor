@@ -226,7 +226,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Telegram username monitor (только проверка)")
     parser.add_argument("command", choices=["login", "check", "run", "status", "notifications-status", "metrics-status", "candidates", "market", "diagnose", "verify-transport"])
     parser.add_argument("candidate_action", nargs="?", choices=["generate", "list", "top", "status", "rescore",
-                                                        "refresh", "compare", "explain", "score"])
+                                                        "refresh", "compare", "explain", "score", "promote", "exclusions"])
     # The positional action is shared with candidates; validate market actions below.
     parser.add_argument("--limit", type=int, default=None, help="Количество имён за цикл (не более MAX_PER_CYCLE)")
     parser.add_argument("--username", help="Имя для diagnose или verify-transport (не выводится в отчёте)")
@@ -234,7 +234,7 @@ def main() -> int:
     parser.add_argument("--idle-probe", action="store_true", help="Проверка 25 секунд простоя и периодических RPC на копии сессии")
     parser.add_argument("--hours", type=int, default=24, help="Период metrics-status в часах (по умолчанию 24)")
     parser.add_argument("--json", action="store_true", help="JSON-отчёт metrics-status")
-    parser.add_argument("--count", type=int, default=300, help="Количество кандидатов для генерации")
+    parser.add_argument("--count", type=int, default=None, help="Количество кандидатов")
     parser.add_argument("--seed", type=int, help="Seed для воспроизводимой генерации")
     parser.add_argument("--top", type=int, default=None, help="Количество строк candidates list/top")
     parser.add_argument("--category", choices=["startup", "short"], help="Фильтр категории candidates list")
@@ -244,6 +244,8 @@ def main() -> int:
     parser.add_argument("--username-market", help="Имя кандидата для market explain")
     parser.add_argument("--file", help="Локальный JSON снимок для market refresh (не нужен для сети)")
     parser.add_argument("--pool", choices=["test", "base"], help="Пул для market compare")
+    parser.add_argument("--apply", action="store_true", help="Явно применить market promote (по умолчанию dry-run)")
+    parser.add_argument("--dry-run", action="store_true", help="Только план market promote, без записи")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     try:
@@ -251,10 +253,16 @@ def main() -> int:
             parser.error("--idle-probe доступен только для verify-transport")
         if args.command == "candidates" and args.candidate_action not in ("generate", "list", "top", "status", "rescore"):
             parser.error("для candidates укажите generate, list, top, status или rescore")
-        if args.command == "market" and args.candidate_action not in ("generate", "status", "refresh", "compare", "explain", "score"):
-            parser.error("для market укажите generate, status, refresh, compare, explain или score")
+        if args.command == "market" and args.candidate_action not in ("generate", "status", "refresh", "compare", "explain", "score", "promote", "exclusions"):
+            parser.error("для market укажите generate, status, refresh, compare, explain, score, promote или exclusions")
         if args.command not in ("candidates", "market") and args.candidate_action is not None:
             parser.error("позиционное действие доступно только для candidates и market")
+        if args.apply and (args.command, args.candidate_action) != ("market", "promote"):
+            parser.error("--apply доступен только для market promote")
+        if args.dry_run and (args.command, args.candidate_action) != ("market", "promote"):
+            parser.error("--dry-run доступен только для market promote")
+        if args.apply and args.dry_run:
+            parser.error("Выберите --apply или --dry-run")
         if args.command in ("status", "notifications-status", "metrics-status", "candidates", "market"):
             from dotenv import load_dotenv
             import os
@@ -265,11 +273,12 @@ def main() -> int:
                 from contextlib import closing
                 from .market_data import connect, fetch_daily, import_daily, market_status, utc
                 from .market_reporting import compare, explain, score_unchecked
-                if args.candidate_action in ("generate", "refresh", "score"):
+                if args.candidate_action in ("generate", "refresh", "score") or \
+                        args.candidate_action == "promote" and args.apply:
                     with closing(connect(db_path)) as db:
                         if args.candidate_action == "generate":
                             from .market_generation import persist_test_pool
-                            rows = persist_test_pool(db, args.count, args.seed)
+                            rows = persist_test_pool(db, args.count if args.count is not None else 300, args.seed)
                             print(f"Тестовый рыночный пул: {len(rows)}; production queue не изменена")
                         elif args.candidate_action == "refresh":
                             try:
@@ -284,8 +293,17 @@ def main() -> int:
                             except (OSError, ValueError):
                                 print("Источник недоступен или данные некорректны; используем последний кеш")
                             print(json.dumps(market_status(db_path), ensure_ascii=False))
-                        else:
+                        elif args.candidate_action == "score":
                             print(f"Рыночные оценки непроверенных кандидатов: {score_unchecked(db)}")
+                        else:
+                            if os.getenv("MARKET_DISCOVERY_ENABLED", "false").lower() not in ("1", "true", "yes"):
+                                raise ValueError("Для применения market promote явно включите MARKET_DISCOVERY_ENABLED=true")
+                            from .market_generation import promote
+                            manual, _ = load_names(Path(os.getenv("USERNAMES_PATH", "usernames.txt")))
+                            report = promote(db, count=args.count if args.count is not None else 20,
+                                             pool_size=min(300, int(os.getenv("AUTO_DISCOVERY_POOL_SIZE", "300"))),
+                                             manual=manual)
+                            print(json.dumps(report, ensure_ascii=False, indent=2))
                 else:
                     if args.candidate_action == "status":
                         report = market_status(db_path)
@@ -293,7 +311,16 @@ def main() -> int:
                         report = {"status": "no_data"}
                     else:
                         with closing(connect(db_path, readonly=True)) as db:
-                            if args.candidate_action == "explain":
+                            if args.candidate_action == "promote":
+                                from .market_generation import promotion_plan
+                                manual, _ = load_names(Path(os.getenv("USERNAMES_PATH", "usernames.txt")))
+                                report = promotion_plan(db, count=args.count if args.count is not None else 20,
+                                                        pool_size=min(300, int(os.getenv("AUTO_DISCOVERY_POOL_SIZE", "300"))),
+                                                        manual=manual)
+                            elif args.candidate_action == "exclusions":
+                                from .market_data import market_exclusions
+                                report = market_exclusions(db)
+                            elif args.candidate_action == "explain":
                                 name = (args.username_market or "").removeprefix("@").lower()
                                 if not USERNAME_PATTERN.fullmatch(name):
                                     parser.error("market explain требует имя через --username-market")
@@ -314,7 +341,8 @@ def main() -> int:
                     with sqlite3.connect(db_path) as db:
                         pool = CandidatePool(SimpleNamespace(db=db, clock=lambda: datetime.now(timezone.utc)))
                         if args.candidate_action == "generate":
-                            added = pool.generate(args.count, seed=args.seed, pool_size=pool_size)
+                            added = pool.generate(args.count if args.count is not None else 300,
+                                                  seed=args.seed, pool_size=pool_size)
                             print(f"Добавлено кандидатов: {added}")
                         else:
                             changed = pool.rescore_unchecked()

@@ -200,6 +200,9 @@ class DiscoveryCase(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(pool.remaining(12), 11)
             self.assertEqual(reopened.db.execute("SELECT status FROM discovery_candidates WHERE username=?",
                                                  (candidate,)).fetchone()[0], "retry")
+            self.assertIsNone(pool.pick([], 12))
+            self.assertFalse(pool.begin(candidate, 12))
+            self.clock.advance(7200)
             self.assertTrue(pool.begin(candidate, 12))
             pool.temporary_error(candidate, "timeout", 600)
             self.assertEqual(pool.remaining(12), 10)
@@ -215,11 +218,13 @@ class DiscoveryCase(unittest.IsolatedAsyncioTestCase):
         with self.store() as store:
             pool = CandidatePool(store)
             pool.generate(12, seed=12, pool_size=12)
-            for _ in range(12):
+            for attempt in range(12):
                 name = pool.pick([], 12)
                 self.assertIsNotNone(name)
                 self.assertTrue(pool.begin(name, 12))
                 pool.temporary_error(name, "network_error", 600)
+                if attempt < 11:
+                    self.clock.advance(7200)
             self.assertEqual(pool.remaining(12), 0)
             self.assertIsNone(pool.pick([], 12))
         with self.store() as store:
@@ -314,6 +319,23 @@ class DiscoveryCase(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(second, ["manual123"])
             self.assertEqual(CandidatePool(store).remaining(12), 11)
 
+    async def test_manual_cycle_stays_at_600_seconds_while_auto_interval_blocks(self):
+        with self.store() as store:
+            pool, auto = self.seeded(store)
+            called = []
+
+            async def check(_client, name):
+                called.append(name)
+                return "occupied", ""
+
+            with patch("username_monitor.telegram_api.check_username", side_effect=check), \
+                    patch("username_monitor.__main__.asyncio.sleep", new_callable=AsyncMock):
+                self.assertEqual(await one_cycle(object(), self.config, store, 2), 600)
+                self.clock.advance(600)
+                self.assertEqual(await one_cycle(object(), self.config, store, 2), 600)
+            self.assertEqual(called, ["manual123", auto, "manual123"])
+            self.assertEqual(pool.remaining(12), 11)
+
     async def test_disabled_never_uses_auto_rpc_and_cancels_only_auto_alert(self):
         with self.store() as store:
             pool, auto = self.seeded(store)
@@ -380,12 +402,12 @@ class DiscoveryCase(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(store.db.execute("SELECT COUNT(*) FROM notification_outbox").fetchone()[0], 0)
             self.assertEqual(store.db.execute("SELECT status FROM discovery_candidates WHERE username=?",
                                               (auto,)).fetchone()[0], "retry")
-            self.clock.advance(600)
+            self.clock.advance(7200)
             with patch("username_monitor.telegram_api.check_username", new_callable=AsyncMock,
                        side_effect=errors.FloodWaitError(request=None, capture=700)):
                 self.assertEqual(await one_cycle(object(), self.config, store, 1), 760)
             self.assertEqual(pool.remaining(12), 10)
-            self.clock.advance(760)
+            self.clock.advance(7200)
             with patch("username_monitor.telegram_api.check_username", new_callable=AsyncMock,
                        side_effect=OSError("private")), self.assertLogs("username_monitor", level="WARNING"):
                 await one_cycle(object(), self.config, store, 1)

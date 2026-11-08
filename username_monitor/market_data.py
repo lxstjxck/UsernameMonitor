@@ -117,6 +117,12 @@ def migrate(db):
             username TEXT NOT NULL, bid_gram REAL NOT NULL, ends_at TEXT NOT NULL,
             PRIMARY KEY(snapshot_id, username, ends_at)
         );
+        CREATE TABLE IF NOT EXISTS market_exclusions (
+            snapshot_id INTEGER NOT NULL REFERENCES market_snapshots(id),
+            username TEXT NOT NULL, kind TEXT NOT NULL CHECK(kind IN ('sale','auction')),
+            reason TEXT NOT NULL,
+            PRIMARY KEY(snapshot_id,username,kind)
+        );
         CREATE TABLE IF NOT EXISTS market_aggregates (
             snapshot_id INTEGER NOT NULL REFERENCES market_snapshots(id),
             bucket TEXT NOT NULL, sales INTEGER NOT NULL, median_gram REAL NOT NULL,
@@ -132,6 +138,9 @@ def migrate(db):
             reason TEXT NOT NULL, generated_at TEXT NOT NULL
         );
     """)
+    db.execute("""INSERT OR IGNORE INTO market_exclusions
+        SELECT snapshot_id,username,'sale',exclusion_reason FROM market_sales
+        WHERE exclusion_reason IS NOT NULL""")
 
 
 def import_daily(db, raw: bytes, *, now=None) -> int:
@@ -150,18 +159,27 @@ def import_daily(db, raw: bytes, *, now=None) -> int:
         for row in doc["sold_24h"]["top"]:
             name = row["name"].lower()
             key = (name, row["sold_at"])
-            reason = ("invalid_or_identity_risk" if unsafe_name(name) else
-                      "duplicate_in_snapshot" if key in seen else
+            reason = ("duplicate_in_snapshot" if key in seen else
+                      "collectible_length4_not_comparable" if len(name) == 4 and name.isalpha() else
+                      "invalid_or_identity_risk" if unsafe_name(name) else
                       "unusual_price_requires_review" if price(row["price_gram"]) > 10_000_000 else None)
             seen.add(key)
             # Duplicate entries have one row in the table; retain the exclusion.
             db.execute("""INSERT INTO market_sales VALUES (?,?,?,?,?)
                 ON CONFLICT(snapshot_id,username,sold_at) DO UPDATE SET exclusion_reason='duplicate_in_snapshot'""",
                 (snapshot_id, name, price(row["price_gram"]), utc(row["sold_at"]).isoformat(), reason))
+            if reason:
+                db.execute("""INSERT INTO market_exclusions VALUES (? ,?,'sale',?)
+                    ON CONFLICT(snapshot_id,username,kind) DO UPDATE SET reason=excluded.reason""",
+                    (snapshot_id, name, reason))
         for row in doc["auctions_ending_24h"]["top"]:
+            auction_name = row["name"].lower()
             db.execute("INSERT OR IGNORE INTO market_auctions VALUES (?,?,?,?)",
-                       (snapshot_id, row["name"].lower(), price(row["bid_gram"]),
+                       (snapshot_id, auction_name, price(row["bid_gram"]),
                         utc(row["ends_at"]).isoformat()))
+            if unsafe_name(auction_name):
+                db.execute("INSERT OR IGNORE INTO market_exclusions VALUES (?,?,'auction',?)",
+                           (snapshot_id, auction_name, "invalid_or_identity_risk"))
         for bucket, item in doc["median_7d"].items():
             db.execute("INSERT INTO market_aggregates VALUES (?,?,?,?)",
                        (snapshot_id, bucket, item["sales"], price(item["median_gram"])))
@@ -190,11 +208,30 @@ def market_status(path: Path, *, now=None) -> dict:
             return {"status": "no_data"}
         sale_count = db.execute("SELECT COUNT(*) FROM market_sales WHERE snapshot_id=?", (snap[0],)).fetchone()[0]
         auction_count = db.execute("SELECT COUNT(*) FROM market_auctions WHERE snapshot_id=?", (snap[0],)).fetchone()[0]
-        excluded = dict(db.execute("""SELECT exclusion_reason,COUNT(*) FROM market_sales
-            WHERE snapshot_id=? AND exclusion_reason IS NOT NULL GROUP BY exclusion_reason""", (snap[0],)))
+        excluded = dict(db.execute("""SELECT reason,COUNT(*) FROM market_exclusions
+            WHERE snapshot_id=? GROUP BY reason""", (snap[0],))) if db.execute(
+                "SELECT 1 FROM sqlite_master WHERE name='market_exclusions'").fetchone() else dict(db.execute(
+                """SELECT exclusion_reason,COUNT(*) FROM market_sales WHERE snapshot_id=?
+                AND exclusion_reason IS NOT NULL GROUP BY exclusion_reason""", (snap[0],)))
         age = max(0, round((now - utc(snap[2])).total_seconds() / 3600, 1))
         return {"status": "cached" if age <= 24 * 30 else "stale", "source": snap[1],
                 "generated_at": snap[2], "fetched_at": snap[3], "age_hours": age,
                 "sample_kind": snap[4], "completed_sales_top_sample": sale_count,
                 "active_auctions": auction_count, "excluded": excluded,
                 "valuation": "insufficient_data"}
+
+
+def market_exclusions(db, *, limit=50):
+    snap = latest(db)
+    if snap is None:
+        return {"status": "no_data", "excluded": []}
+    tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    if "market_exclusions" in tables:
+        rows = db.execute("""SELECT username,kind,reason FROM market_exclusions
+            WHERE snapshot_id=? ORDER BY kind,username LIMIT ?""", (snap[0], limit)).fetchall()
+    else:
+        rows = db.execute("""SELECT username,'sale',exclusion_reason FROM market_sales
+            WHERE snapshot_id=? AND exclusion_reason IS NOT NULL ORDER BY username LIMIT ?""",
+            (snap[0], limit)).fetchall()
+    return {"status": "ok", "source": snap[1], "generated_at": snap[2],
+            "excluded": [{"username": n, "kind": k, "reason": r} for n, k, r in rows]}
